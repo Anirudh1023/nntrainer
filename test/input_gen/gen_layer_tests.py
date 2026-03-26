@@ -141,6 +141,9 @@ if __name__ == "__main__":
     ln = K.layers.LayerNormalization([1, 2, 3])
     record_single(ln, (2, 4, 2, 3), "ln_axis_1_2_3")
 
+    ln = K.layers.LayerNormalization([2])
+    record_single(ln, (1, 1, 768, 1024), "ln_axis_3_large")
+
     conv = K.layers.Conv2D(3, 2)
     record_single(conv, (1, 1, 4, 4), "conv2d_sb_minimum")
     record_single(conv, (3, 1, 4, 4), "conv2d_mb_minimum")
