@@ -425,7 +425,12 @@ def record_single(layer, input_shape, test_name, call_args={}, input_type='int')
 
     weights = layer.weights.copy()
     gradients = tape.gradient(dy_constant, layer.trainable_weights)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
     derivatives = tape.gradient(dy_constant, inputs)
+    if isinstance(inputs, list):
+        derivatives = [tf.zeros_like(i) if d is None else d for d, i in zip(derivatives, inputs)]
+    else:
+        derivatives = tf.zeros_like(inputs) if derivatives is None else derivatives
 
     try:
         gradients = layer.to_nntr_trainable_weights(gradients)
@@ -474,7 +479,12 @@ def record_single_fp16(layer, input_shape, test_name, call_args={}, input_type='
 
     weights = layer.weights.copy()
     gradients = tape.gradient(dy_constant, layer.trainable_weights)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
     derivatives = tape.gradient(dy_constant, inputs)
+    if isinstance(inputs, list):
+        derivatives = [tf.zeros_like(i) if d is None else d for d, i in zip(derivatives, inputs)]
+    else:
+        derivatives = tf.zeros_like(inputs) if derivatives is None else derivatives
 
     try:
         gradients = layer.to_nntr_trainable_weights(gradients)
@@ -524,6 +534,7 @@ def record_single_embedding_mixed(layer, input_shape, test_name, call_args={}, i
 
     weights = layer.weights.copy()
     gradients = tape.gradient(dy_constant, layer.trainable_weights)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
     gradients = tf.convert_to_tensor(gradients[0])
 
     try:
@@ -579,6 +590,7 @@ def record_single_embedding_fp32(layer, input_shape, test_name, call_args={}, in
 
     weights = layer.weights.copy()
     gradients = tape.gradient(dy_constant, layer.trainable_weights)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
     gradients = tf.convert_to_tensor(gradients[0])
 
     try:

@@ -26,14 +26,15 @@ class AbstractTransLayer(K.layers.Layer):
     def __init__(self, tf_layer, *args, **kwargs):
         if not isinstance(tf_layer, K.layers.Layer):
             raise ValueError("tf_layer must be type of keras layer")
-        super().__init__(*args, **kwargs, name=tf_layer.name + "/translated")
+        super().__init__(*args, **kwargs, name=tf_layer.name + "_translated")
         self.tf_layer = tf_layer
         self.call.__func__.__signature__ = signature(self.tf_layer.call)
         self.has_training = "training" in inspect.getfullargspec(self.call).args
 
     def build(self, input_shape):
         if not self.built:
-            self.tf_layer.build(input_shape)
+            if not getattr(self.tf_layer, "built", False):
+                self.tf_layer.build(input_shape)
             super().build(input_shape)
 
     ##
@@ -78,6 +79,14 @@ class AbstractTransLayer(K.layers.Layer):
     @property
     def weights(self):
         return self.to_nntr_weights(self.tf_layer.weights)
+
+    @property
+    def trainable_weights(self):
+        return self.to_nntr_trainable_weights(self.tf_layer.trainable_weights)
+
+    @property
+    def non_trainable_weights(self):
+        return self.to_nntr_weights(self.tf_layer.non_trainable_weights)
 
 
 ##
@@ -139,6 +148,8 @@ class ChannelLastTransLayer(AbstractTransLayer):
 
     @classmethod
     def _nntr_kernel(cls, tensor):
+        if tensor is None:
+            return None
         if tf.rank(tensor).numpy() == 4:
             return tf.transpose(tensor, perm=cls.TO_NNTR_KERNEL_4D)
         elif tf.rank(tensor).numpy() == 3:
@@ -150,6 +161,35 @@ class ChannelLastTransLayer(AbstractTransLayer):
 
     def to_nntr_weights(self, weights):
         return [self._nntr_kernel(t) for t in weights]
+
+
+class Conv1DTransLayer(ChannelLastTransLayer):
+    def build(self, input_shape):
+        if self.built:
+            return
+
+        if isinstance(input_shape, tf.TensorShape):
+            input_shape_list_ = input_shape.as_list()
+        else:
+            input_shape_list_ = input_shape
+        transposed_list_ = [None] * 4
+
+        for idx, i in enumerate((0,) + ChannelLastTransLayer.TO_CHANNELS_LAST):
+            transposed_list_[idx] = input_shape_list_[i]
+
+        transposed_input_shape_3d = tf.TensorShape([transposed_list_[0], transposed_list_[2], transposed_list_[3]])
+        if not getattr(self.tf_layer, "built", False):
+            self.tf_layer.build(transposed_input_shape_3d)
+
+        K.layers.Layer.build(self, tf.TensorShape(transposed_list_))
+
+    def to_tf_tensor(self, tensor):
+        tensor = self.to_tf_layer_(tensor)
+        return tf.squeeze(tensor, axis=1)
+
+    def to_nntr_tensor(self, tensor):
+        tensor = tf.expand_dims(tensor, axis=1)
+        return self.to_nntr_layer_(tensor)
 
 
 CHANNEL_LAST_LAYERS = (
@@ -203,7 +243,7 @@ class LayerNormTransLayer(IdentityTransLayer):
         if 3 in axis:
             perm = [i for i in range(len(axis))]
             perm = [perm[-1]] + perm[:-1]
-            return [tf.transpose(weight, perm=perm) for weight in weights]
+            return [tf.transpose(weight, perm=perm) if weight is not None else None for weight in weights]
         return weights
 
 ##
@@ -242,7 +282,8 @@ class MultiOutLayer(IdentityTransLayer):
 class RNNCELL_LSTMCellTransLayer(IdentityTransLayer):
     def build(self, input_shape):
         if not self.built:
-            self.tf_layer.build(input_shape[0])
+            if not getattr(self.tf_layer, "built", False):
+                self.tf_layer.build(input_shape[0])
             super().build(input_shape[0])
 
     ##
@@ -258,12 +299,12 @@ class RNNCELL_LSTMCellTransLayer(IdentityTransLayer):
 # @brief Translayer for gru layer
 class GRUTransLayer(IdentityTransLayer):
     def to_nntr_weights(self, tensorOrList):
-        bias = tensorOrList[2]
-        if bias.shape.rank == 2:
-            bias_ih, bias_hh = bias[0], bias[1]
-            return [tensorOrList[0], tensorOrList[1], bias_ih, bias_hh]
-        else:
-            return tensorOrList
+        if len(tensorOrList) > 2 and tensorOrList[2] is not None:
+            bias = tensorOrList[2]
+            if hasattr(bias, 'shape') and bias.shape.rank == 2:
+                bias_ih, bias_hh = bias[0], bias[1]
+                return [tensorOrList[0], tensorOrList[1], bias_ih, bias_hh]
+        return tensorOrList
 
     def to_nntr_trainable_weights(self, tensorOrList):
         return self.to_nntr_weights(tensorOrList)
@@ -271,7 +312,8 @@ class GRUTransLayer(IdentityTransLayer):
 class GRUCellTransLayer(IdentityTransLayer):
     def build(self, input_shape):
         if not self.built:
-            self.tf_layer.build(input_shape[0])
+            if not getattr(self.tf_layer, "built", False):
+                self.tf_layer.build(input_shape[0])
             super().build(input_shape[0])
 
     ##
@@ -284,12 +326,12 @@ class GRUCellTransLayer(IdentityTransLayer):
         return output
 
     def to_nntr_weights(self, tensorOrList):
-        bias = tensorOrList[2]
-        if bias.shape.rank == 2:
-            bias_ih, bias_hh = bias[0], bias[1]
-            return [tensorOrList[0], tensorOrList[1], bias_ih, bias_hh]
-        else:
-            return tensorOrList
+        if len(tensorOrList) > 2 and tensorOrList[2] is not None:
+            bias = tensorOrList[2]
+            if hasattr(bias, 'shape') and bias.shape.rank == 2:
+                bias_ih, bias_hh = bias[0], bias[1]
+                return [tensorOrList[0], tensorOrList[1], bias_ih, bias_hh]
+        return tensorOrList
 
     def to_nntr_trainable_weights(self, tensorOrList):
         return self.to_nntr_weights(tensorOrList)
@@ -324,6 +366,9 @@ def attach_trans_layer(layer):
         (K.layers.LayerNormalization),
     ):
         return LayerNormTransLayer(layer)
+
+    if isinstance(layer, K.layers.Conv1D):
+        return Conv1DTransLayer(layer)
 
     if isinstance(layer, CHANNEL_LAST_LAYERS):
         return ChannelLastTransLayer(layer)
