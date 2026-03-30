@@ -424,8 +424,14 @@ def record_single(layer, input_shape, test_name, call_args={}, input_type='int')
         dy_constant = outputs * 2  # set incoming derivative to 2 instead of 1
 
     weights = layer.weights.copy()
-    gradients = tape.gradient(dy_constant, layer.trainable_weights)
-    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
+    # Compute gradients against the ORIGINAL Keras weights (which GradientTape traced),
+    # not the transposed copies from layer.trainable_weights property.
+    try:
+        original_trainable = layer.tf_layer.trainable_weights
+    except AttributeError:
+        original_trainable = layer.trainable_weights
+    gradients = tape.gradient(dy_constant, original_trainable)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, original_trainable)]
     derivatives = tape.gradient(dy_constant, inputs)
     if isinstance(inputs, list):
         derivatives = [tf.zeros_like(i) if d is None else d for d, i in zip(derivatives, inputs)]
@@ -478,8 +484,12 @@ def record_single_fp16(layer, input_shape, test_name, call_args={}, input_type='
         dy_constant = outputs * 2  # set incoming derivative to 2 instead of 1
 
     weights = layer.weights.copy()
-    gradients = tape.gradient(dy_constant, layer.trainable_weights)
-    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
+    try:
+        original_trainable = layer.tf_layer.trainable_weights
+    except AttributeError:
+        original_trainable = layer.trainable_weights
+    gradients = tape.gradient(dy_constant, original_trainable)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, original_trainable)]
     derivatives = tape.gradient(dy_constant, inputs)
     if isinstance(inputs, list):
         derivatives = [tf.zeros_like(i) if d is None else d for d, i in zip(derivatives, inputs)]
@@ -533,8 +543,12 @@ def record_single_embedding_mixed(layer, input_shape, test_name, call_args={}, i
         dy_constant = outputs * 2  # set incoming derivative to 2 instead of 1
 
     weights = layer.weights.copy()
-    gradients = tape.gradient(dy_constant, layer.trainable_weights)
-    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
+    try:
+        original_trainable = layer.tf_layer.trainable_weights
+    except AttributeError:
+        original_trainable = layer.trainable_weights
+    gradients = tape.gradient(dy_constant, original_trainable)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, original_trainable)]
     gradients = tf.convert_to_tensor(gradients[0])
 
     try:
@@ -589,8 +603,12 @@ def record_single_embedding_fp32(layer, input_shape, test_name, call_args={}, in
         dy_constant = outputs * 2  # set incoming derivative to 2 instead of 1
 
     weights = layer.weights.copy()
-    gradients = tape.gradient(dy_constant, layer.trainable_weights)
-    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, layer.trainable_weights)]
+    try:
+        original_trainable = layer.tf_layer.trainable_weights
+    except AttributeError:
+        original_trainable = layer.trainable_weights
+    gradients = tape.gradient(dy_constant, original_trainable)
+    gradients = [tf.zeros_like(w) if g is None else g for g, w in zip(gradients, original_trainable)]
     gradients = tf.convert_to_tensor(gradients[0])
 
     try:
