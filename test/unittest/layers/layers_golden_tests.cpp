@@ -461,6 +461,20 @@ TEST_P(LayerGoldenTest, run) {
     layer->forwarding(rc, !shouldForwardWithInferenceMode());
   }
 
+  // Dump C++ forward output to binary file for manual inspection
+  {
+    Tensor &output = rc.getOutput(0);
+    std::string golden_name = std::get<3>(GetParam());
+    std::string dump_name = "/data/local/tmp/" + golden_name + ".cpp_output.bin";
+    std::ofstream dump(dump_name, std::ios::binary);
+    if (dump.is_open()) {
+      float *data = output.getData<float>();
+      unsigned int sz = output.size();
+      dump.write(reinterpret_cast<char*>(&sz), sizeof(unsigned int));
+      dump.write(reinterpret_cast<char*>(data), sz * sizeof(float));
+    }
+  }
+
   if (!skip_calc_grad) {
     layer->calcGradient(rc);
   }
