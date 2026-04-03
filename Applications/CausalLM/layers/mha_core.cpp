@@ -192,7 +192,9 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  * @date 2024-09-02
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {}
+                              bool training) {
+  throw nntrainer::exception::not_supported("MHACoreLayer: forwarding for training is not yet implemented. Caching mechanisms for QK^T are missing.");
+}
 
 /**
  * @note This incremental_forwarding method is invoked for inference mode.
@@ -1292,9 +1294,13 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
 
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
+void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  throw nntrainer::exception::not_supported("MHACoreLayer: calcDerivative for training is not yet implemented.");
+}
 
-void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  throw nntrainer::exception::not_supported("MHACoreLayer: calcGradient for training is not yet implemented.");
+}
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
                             const ml::train::ExportMethods &method) const {

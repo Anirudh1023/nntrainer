@@ -94,6 +94,11 @@ public:
   exportTo(nntrainer::Exporter &exporter,
            const ml::train::ExportMethods &method) const override;
 
+  WIN_EXPORT void
+  save(std::ofstream &file, nntrainer::RunLayerContext &run_context,
+       bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+       nntrainer::TensorDim::DataType definedWeightDataType) const override;
+
   /**
    * @copydoc Layer::getType()
    */
@@ -104,7 +109,7 @@ public:
   /**
    * @copydoc Layer::supportBackwarding()
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  WIN_EXPORT bool supportBackwarding() const override { return true; }
 
   using Layer::setProperty;
 
