@@ -15,9 +15,11 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include <conv2d_layer.h>
 #include <cpu_backend.h>
+#include <ggml_interface.h>
 #include <layer_context.h>
 #include <lazy_tensor.h>
 #include <nntr_threads.h>
@@ -25,8 +27,8 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <profiler.h>
+#include <q4_0_tensor.h>
 #include <tensor_dim.h>
-#include <thread>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -437,6 +439,74 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   filter_kernel.reshape(filter_dim_squeezed);
 
   /**
+   * For W4A8 quantized inference with FP32 input weights:
+   * Quantize the FP32 filter to Q4_0 format ONCE before the batch loop.
+   *
+   * For GGML/Q4_0: transpose FP32 filter (K, CRS) → (CRS, K) then quantize.
+   * For KAI/QINT4: quantize directly (kernel uses transB=true).
+   *
+   * The quantized filter is reused across all batches.
+   */
+  auto wt_dtype = filter_kernel.getDataType();
+  bool use_quantized_gemm = false;
+  Tensor filter_q4;
+  unsigned int K_padded = filter_size;
+
+#ifdef ENABLE_CONV2D_W4A8
+  if (wt_dtype == ml::train::TensorDim::DataType::FP32 ||
+      wt_dtype == ml::train::TensorDim::DataType::FP16) {
+    /**
+     * Runtime quantization: FP32/FP16 weights → Q4_0
+     * Transpose filter (K, CRS) → (CRS, K), quantize, then use swapped GEMM.
+     * Enable with -DENABLE_CONV2D_W4A8 build flag.
+     */
+    unsigned int K_filters = filter_kernel.height();
+    unsigned int CRS = filter_kernel.width();
+
+    K_padded = ((K_filters + 31) / 32) * 32;
+
+    // Transpose FP32 filter: (K, CRS) → (CRS, K)
+    Tensor filter_t = filter_kernel.transpose("0:2:1");
+
+    // Pad to K_padded width if needed
+    unsigned int total_elements = CRS * K_padded;
+    std::vector<float> padded_data(total_elements, 0.0f);
+    const float *src = filter_t.getData<float>();
+    for (unsigned int r = 0; r < CRS; ++r) {
+      std::memcpy(&padded_data[r * K_padded], &src[r * K_filters],
+                  K_filters * sizeof(float));
+    }
+
+    // Quantize FP32 → Q4_0 using GGML
+    size_t q4_block_count = (CRS * K_padded) / QK4_0;
+    std::vector<uint8_t> q4_data(q4_block_count * Q4_0_SIZE);
+    __ggml_quantize_q4_0(padded_data.data(), q4_data.data(),
+                         static_cast<int64_t>(CRS),
+                         static_cast<int64_t>(K_padded), nullptr);
+
+    // Create Q4_0 Tensor: dim = (CRS, K_padded)
+    TensorDim q4_dim(1, 1, CRS, K_padded);
+    q4_dim.setDataType(ml::train::TensorDim::DataType::Q4_0);
+    q4_dim.setFormat(filter_kernel.getFormat());
+    filter_q4 = Tensor(q4_dim, q4_data.data());
+    use_quantized_gemm = true;
+
+#ifdef ENABLE_FP16
+    /// @todo Add KAI QINT4 path: nntr_quant_qs4cx_f32() +
+    ///       nntr_qsi4cxp_qs4cxs1s0_rhs_pack() for ARM-optimized inference.
+    ///       KAI uses transB=true so filter stays in (K, CRS) layout.
+#endif
+  } else
+#endif // ENABLE_CONV2D_W4A8
+  if (wt_dtype == ml::train::TensorDim::DataType::Q4_0 ||
+      wt_dtype == ml::train::TensorDim::DataType::QINT4) {
+    // Weights already quantized — use directly
+    filter_q4 = filter_kernel;
+    K_padded = filter_q4.width();
+    use_quantized_gemm = true;
+  }
+
+  /**
    * Below sets the pad area values to zero
    * it is faster to do this way than seting selective area to zero
    */
@@ -450,8 +520,49 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
       Tensor in_sub = input_.getBatchSlice(b, 1);
 
       im2col(in_sub, filter_dim, padding, stride, dilation, result);
-      // filter kernel is (K, CRS), result is (CRS, OH*OW)
-      filter_kernel.dot(result, out, false, true);
+
+      if (use_quantized_gemm) {
+        /**
+         * Quantized W4A8 path:
+         * Swap operand order: im2col(FP32) × weight(Q4) → output
+         *
+         * im2col result (CRS, OH*OW) → transpose → (OH*OW, CRS)
+         * GEMM: (OH*OW, CRS) × Q4_weight(CRS, K_padded) → (OH*OW, K_padded)
+         * Extract first K columns, transpose → (K, OH*OW) = output
+         */
+        unsigned int OH_OW = out_dim.width() * out_dim.height();
+
+        // Transpose FP32 im2col: (CRS, OH*OW) → (OH*OW, CRS)
+        Tensor result_t = result.transpose("0:2:1");
+
+        // Quantized GEMM: FP32 activation × Q4 weight → FP32 output
+        unsigned int K_out = filter_q4.width(); // K_padded
+        Tensor temp_out(
+          TensorDim({OH_OW, K_out}, out.getTensorType()));
+        result_t.dot(filter_q4, temp_out, false, false);
+
+        if (K_out == filter_size) {
+          // No padding — direct transpose
+          Tensor final_out = temp_out.transpose("0:2:1");
+          out.copyData(final_out);
+        } else {
+          // Padded — extract first filter_size columns, then transpose
+          // temp_out is (OH*OW, K_padded), we need (OH*OW, filter_size)
+          float *temp_data = temp_out.getData<float>();
+          Tensor trimmed(TensorDim({OH_OW, filter_size}, out.getTensorType()));
+          float *trim_data = trimmed.getData<float>();
+          for (unsigned int r = 0; r < OH_OW; ++r) {
+            std::memcpy(&trim_data[r * filter_size],
+                        &temp_data[r * K_out],
+                        filter_size * sizeof(float));
+          }
+          Tensor final_out = trimmed.transpose("0:2:1");
+          out.copyData(final_out);
+        }
+      } else {
+        // Original FP32/FP16 path — untouched
+        filter_kernel.dot(result, out, false, true);
+      }
     }
     result.deallocate();
   };
