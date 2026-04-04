@@ -39,12 +39,12 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::inv_rms] = context.requestTensor(
-    inv_rms_dim, "inv_rms", nntrainer::props::InitializerInfo::Enum::NONE, false,
+    inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 
   // Temp tensor for calcDerivative: same shape as input
   wt_idx[RMSParams::temp_full] = context.requestTensor(
-    dim[0], "temp_full", nntrainer::props::InitializerInfo::Enum::NONE, false,
+    dim[0], "temp_full", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::CALC_DERIV_LIFESPAN);
 }
 

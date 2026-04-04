@@ -42,14 +42,14 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::inv_rms] = context.requestTensor(
-    inv_rms_dim, "inv_rms", nntrainer::props::InitializerInfo::Enum::NONE, false,
+    inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 
   nntrainer::TensorDim temp_dim = dim[0];
   temp_dim.height(reshaped_height);
   temp_dim.width(feature_size);
   wt_idx[RMSParams::temp_full] = context.requestTensor(
-    temp_dim, "temp_full", nntrainer::props::InitializerInfo::Enum::NONE, false,
+    temp_dim, "temp_full", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::CALC_DERIV_LIFESPAN);
 }
 
@@ -153,46 +153,62 @@ void ReshapedRMSNormLayer::updateTensorsByInputDimensions(
 }
 
 void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  nntrainer::Tensor &dy = const_cast<nntrainer::Tensor&>(context.getIncomingDerivative(SINGLE_INOUT_IDX));
+  auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
+
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &in = const_cast<nntrainer::Tensor&>(context.getInput(SINGLE_INOUT_IDX));
-
   nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
-  nntrainer::Tensor &inv_rms = context.getTensor(wt_idx[RMSParams::inv_rms]);
-  nntrainer::Tensor &temp = context.getTensor(wt_idx[RMSParams::temp_full]);
 
-  ml::train::TensorDim original_dim = in.getDim();
-  ml::train::TensorDim reshaped_dim = original_dim;
-  reshaped_dim.width(feature_size);
-  reshaped_dim.height(original_dim.height() * (original_dim.width() / feature_size));
+  ml::train::TensorDim in_dim = in.getDim();
+  unsigned int b_size = in_dim.batch();
+  unsigned int width = in_dim.width();
 
-  // Modifying the Tensor metadata inline to bypass deep copies
-  dy.reshape(reshaped_dim);
-  dx.reshape(reshaped_dim);
-  in.reshape(reshaped_dim);
+  ml::train::TensorDim in_step_dim = in_dim;
+  in_step_dim.batch(1);
 
-  // gamma_dy = gamma * incoming_derivative
-  dy.multiply(gamma, temp);
+  for (unsigned int b = 0; b < b_size; ++b) {
+    nntrainer::Tensor in_step =
+      in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
+    nntrainer::Tensor dy_step =
+      dy.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
+    nntrainer::Tensor dx_step =
+      dx.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
 
-  // c_full = gamma_dy * x
-  temp.multiply(in, dx);
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const float *in_data = in_step.getData<float>();
+      const float *dy_data = dy_step.getData<float>();
+      float *dx_data = dx_step.getData<float>();
+      const float *gamma_data = gamma.getData<float>();
 
-  // mean_val = sum(c_full) / width
-  nntrainer::Tensor mean_val = dx.average(3);
+      unsigned int height = in_step_dim.height() * (width / feature_size);
 
-  // inv_rms_sq
-  nntrainer::Tensor inv_rms_sq = inv_rms.multiply(inv_rms);
+      for(unsigned int h = 0; h < height; ++h) {
+          float sum_sq = 0.0f;
+          for(unsigned int w = 0; w < feature_size; ++w) {
+              float val = in_data[h * feature_size + w];
+              sum_sq += val * val;
+          }
+          float mean_sq = sum_sq / feature_size;
+          float var_eps = mean_sq + epsilon;
+          float inv_v = 1.0f / var_eps;
+          float inv_sqrt_v = 1.0f / std::sqrt(var_eps);
 
-  // dx = inv_rms * (gamma_dy - x * mean(gamma_dy * x) * inv_rms^2)
-  in.multiply(mean_val, dx);
-  dx.multiply_i(inv_rms_sq);
-  temp.subtract(dx, dx);
-  dx.multiply_i(inv_rms);
+          float sum_term = 0.0f;
+          for(unsigned int w = 0; w < feature_size; ++w) {
+              sum_term += (dy_data[h * feature_size + w] * gamma_data[w]) * in_data[h * feature_size + w];
+          }
 
-  // Restoring natural dimensions
-  dy.reshape(original_dim);
-  dx.reshape(original_dim);
-  in.reshape(original_dim);
+          for(unsigned int w = 0; w < feature_size; ++w) {
+              float dy_g = dy_data[h * feature_size + w] * gamma_data[w];
+              float term2 = (in_data[h * feature_size + w] * inv_v * sum_term) / feature_size;
+              dx_data[h * feature_size + w] = (dy_g - term2) * inv_sqrt_v;
+          }
+      }
+    } else {
+      throw std::invalid_argument("Error: not yet implemented for this data type");
+    }
+  }
 }
 
 void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {

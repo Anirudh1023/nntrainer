@@ -351,8 +351,13 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    // Training cache tensors (allocated only in TRAIN mode)
+    train_query,
+    train_key,
+    train_value,
+    train_attn_wt,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 11> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */
@@ -406,6 +411,15 @@ private:
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
                                   bool convert_only = false);
+
+  /**
+   * @brief     apply inverse rotary embedding in-place
+   * @param[in,out] tensor tensor to inverse-rotate
+   * @param[in] dim hidden dim size
+   * @param[in] from sequence position offset
+   */
+  void apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
+                                unsigned int dim, unsigned int from);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,
