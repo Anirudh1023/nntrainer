@@ -465,9 +465,81 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
     return filepath
 
 
+def gen_embedding_layer_golden(batch=2, seq_len=10, in_dim=100, out_dim=10,
+                              filename="causallm_embedding_layer.nnlayergolden"):
+    """Generate golden data for CausalLM Embedding Layer with backward pass.
+
+    Embedding forward: output = embedding_lookup(input_indices)
+    Weight shape: (1, 1, in_dim, out_dim)
+    Input: token indices [0, in_dim)
+    Output shape: (batch, 1, seq_len, out_dim)
+
+    Backward (incoming_deriv = 2.0):
+    dW[embed_idx] += dy[position]  (accumulate gradients for used embeddings)
+    No derivative to propagate back (discrete input).
+    """
+    # Initial weights: random weights for embedding
+    weight = np.random.randn(1, 1, in_dim, out_dim).astype(np.float32)
+
+    # Input: random integer token indices
+    x = rand_input((batch, 1, 1, seq_len))
+    # Ensure indices are within valid range
+    x = np.clip(x, 0, in_dim - 1).astype(np.int32).astype(np.float32)
+
+    # Forward pass: embedding lookup
+    # Reshape input for easy indexing
+    x_flat = x.reshape(-1).astype(np.int32)
+    output = np.zeros((batch, seq_len, out_dim), dtype=np.float32)
+    
+    for i in range(x_flat.size):
+        embed_idx = x_flat[i]
+        b = i // seq_len
+        s = i % seq_len
+        output[b, s, :] = weight[0, 0, embed_idx, :]
+
+    output = output.reshape(batch, 1, seq_len, out_dim)
+
+    # Backward pass: incoming_deriv = 2.0
+    incoming_deriv = np.full_like(output, 2.0)
+    
+    # Compute weight gradients
+    # dW[embed_idx] += dy[position]
+    dweight = np.zeros_like(weight)
+    
+    for i in range(x_flat.size):
+        embed_idx = x_flat[i]
+        b = i // seq_len
+        s = i % seq_len
+        dweight[0, 0, embed_idx, :] += incoming_deriv[b, 0, s, :]
+
+    # No derivative for input (discrete)
+
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    with open(filepath, "wb") as f:
+        # 1. Initial weights
+        write_tensor(f, weight)
+        # 2. Inputs
+        write_tensor(f, x)
+        # 3. Outputs
+        write_tensor(f, output)
+        # 4. Gradients (weight gradient)
+        write_tensor(f, dweight)
+        # 5. Weights (unchanged - no optimizer step)
+        write_tensor(f, weight)
+        # 6. Derivatives (none for embedding layer - no derivative to propagate back)
+
+    print(f"Generated: {filepath}")
+    print(f"  input shape: {x.shape}, weight shape: {weight.shape}")
+    print(f"  output shape: {output.shape}")
+    print(f"  weight gradient sample: {dweight.flat[:5]}")
+
+    return filepath
+
+
 if __name__ == "__main__":
     gen_rms_norm_golden()
     gen_lm_head_golden()
     gen_swiglu_golden()
     gen_tie_word_embedding_golden()
     gen_mha_core_golden()
+    gen_embedding_layer_golden()
