@@ -30,8 +30,8 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
+    gamma_dim, nntrainer::Initializer::ONES,
+    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
 
   // Cache inv_rms for backward pass: shape (batch, channel, height, 1)
   nntrainer::TensorDim inv_rms_dim(
@@ -39,12 +39,12 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::inv_rms] = context.requestTensor(
-    inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
+    inv_rms_dim, "inv_rms", nntrainer::props::InitializerInfo::Enum::NONE, false,
     nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 
   // Temp tensor for calcDerivative: same shape as input
   wt_idx[RMSParams::temp_full] = context.requestTensor(
-    dim[0], "temp_full", nntrainer::Initializer::NONE, false,
+    dim[0], "temp_full", nntrainer::props::InitializerInfo::Enum::NONE, false,
     nntrainer::TensorLifespan::CALC_DERIV_LIFESPAN);
 }
 
@@ -77,17 +77,21 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+  nntrainer::Tensor &inv_rms = context.getTensor(wt_idx[RMSParams::inv_rms]);
 
   ml::train::TensorDim in_dim = in.getDim();
   ml::train::TensorDim out_dim = out.getDim();
 
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
+  ml::train::TensorDim inv_rms_step_dim = inv_rms.getDim();
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);
   out_step_dim.batch(1);
   out_step_dim.height(to - from);
+  inv_rms_step_dim.batch(1);
+  inv_rms_step_dim.height(to - from);
 
   unsigned int b_size = in_dim.batch();
 
@@ -96,10 +100,13 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen() + from * in_dim.width(), true);
     nntrainer::Tensor out_step =
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen() + from * out_dim.width(), true);
+    nntrainer::Tensor inv_rms_step =
+      inv_rms.getSharedDataTensor(inv_rms_step_dim, b * inv_rms.getDim().getFeatureLen() + from, true);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       auto t = in_step.multiply(in_step).average(3).add(epsilon);
       t.inv_sqrt_i();
+      inv_rms_step.copyData(t);
       in_step.multiply(t, out_step);
     } else {
       throw std::invalid_argument(
@@ -161,50 +168,33 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
 }
 
 void RMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
-
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &dgamma = context.getWeightGrad(wt_idx[RMSParams::gamma]);
+  nntrainer::Tensor &inv_rms = context.getTensor(wt_idx[RMSParams::inv_rms]);
 
   dgamma.setZero();
 
-  ml::train::TensorDim in_dim = in.getDim();
-  unsigned int b_size = in_dim.batch();
-  unsigned int width = in_dim.width();
-
-  ml::train::TensorDim in_step_dim = in_dim;
-  in_step_dim.batch(1);
-
-  for (unsigned int b = 0; b < b_size; ++b) {
-    nntrainer::Tensor in_step =
-      in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
-    nntrainer::Tensor dy_step =
-      dy.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
-
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      const float *in_data = in_step.getData<float>();
-      const float *dy_data = dy_step.getData<float>();
-      float *dgamma_data = dgamma.getData<float>();
-      
-      unsigned int height = in_step_dim.height();
-      
-      for(unsigned int h = 0; h < height; ++h) {
-          float sum_sq = 0.0f;
-          for(unsigned int w = 0; w < width; ++w) {
-              float val = in_data[h * width + w];
-              sum_sq += val * val;
-          }
-          float mean_sq = sum_sq / width;
-          float inv_sqrt_v = 1.0f / std::sqrt(mean_sq + epsilon);
-
-          for(unsigned int w = 0; w < width; ++w) {
-              dgamma_data[w] += dy_data[h * width + w] * in_data[h * width + w] * inv_sqrt_v;
-          }
-      }
-    } else {
-      throw std::invalid_argument("Error: not yet implemented for this data type");
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    const float *in_data = in.getData<float>();
+    const float *dy_data = dy.getData<float>();
+    const float *inv_rms_data = inv_rms.getData<float>();
+    float *dgamma_data = dgamma.getData<float>();
+    
+    unsigned int batch = in.getDim().batch();
+    unsigned int channel = in.getDim().channel();
+    unsigned int height = in.getDim().height();
+    unsigned int width = in.getDim().width();
+    unsigned int batch_channel_height = batch * channel * height;
+    unsigned int channel_height = channel * height;
+    
+    for (unsigned int i = 0; i < batch_channel_height * width; ++i) {
+      unsigned int bch = i / width;
+      unsigned int w = i % width;
+      dgamma_data[w] += dy_data[i] * in_data[i] * inv_rms_data[bch];
     }
+  } else {
+    throw std::invalid_argument("Error: not yet implemented for this data type");
   }
 }
 
