@@ -53,7 +53,7 @@ def gen_rms_norm_golden(input_shape=(2, 3, 3, 3), epsilon=1e-3,
     """
     width = input_shape[-1]
 
-    # Initial weights: gamma = ones
+    # Initial weights: gamma = ones (not trainable — frozen at init)
     gamma = np.ones((1, 1, 1, width), dtype=np.float32)
 
     # Input
@@ -62,17 +62,13 @@ def gen_rms_norm_golden(input_shape=(2, 3, 3, 3), epsilon=1e-3,
     # Forward pass
     mean_sq = np.mean(x * x, axis=-1, keepdims=True)  # mean(x^2)
     inv_rms = 1.0 / np.sqrt(mean_sq + epsilon)
-    output = x * inv_rms * gamma
+    output  = x * inv_rms * gamma
 
-    # Backward pass
-    # incoming derivative = 2.0
+    # Backward pass — incoming derivative = 2.0
     incoming_deriv = np.full_like(output, 2.0)
-    # gamma_dy = gamma * incoming_deriv
     gamma_dy = gamma * incoming_deriv
-    # c = mean(gamma_dy * x, axis=-1, keepdims=True)
-    c = np.mean(gamma_dy * x, axis=-1, keepdims=True)
-    # dx = inv_rms * (gamma_dy - x * c * inv_rms^2)
-    dx = inv_rms * (gamma_dy - x * c * inv_rms * inv_rms)
+    c        = np.mean(gamma_dy * x, axis=-1, keepdims=True)
+    dx       = inv_rms * (gamma_dy - x * c * inv_rms * inv_rms)
 
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "wb") as f:
@@ -105,44 +101,43 @@ def gen_lm_head_golden(input_shape=(2, 1, 1, 10), unit=5,
 
     Backward (incoming_deriv = 2.0):
     dx = dy @ W^T
+    dW = x^T @ dy
     """
     in_width = input_shape[-1]
 
     # Weight: shape (1, 1, in_width, unit)
     weight = rand_input((1, 1, in_width, unit))
-    # Bias: disabled for this test
 
     # Input
     x = rand_input(input_shape)
 
     # Forward: output = x @ weight
-    # x shape: (batch, 1, 1, in_width), weight: (1, 1, in_width, unit)
-    # dot: (batch, 1, 1, in_width) x (1, 1, in_width, unit) -> (batch, 1, 1, unit)
-    x_2d = x.reshape(-1, in_width)
-    w_2d = weight.reshape(in_width, unit)
+    x_2d   = x.reshape(-1, in_width)
+    w_2d   = weight.reshape(in_width, unit)
     out_2d = x_2d @ w_2d
     output = out_2d.reshape(input_shape[0], 1, 1, unit)
 
     # Backward: incoming_deriv = 2.0
     incoming_deriv = np.full_like(output, 2.0)
-    # dx = dy @ W^T
     dy_2d = incoming_deriv.reshape(-1, unit)
-    dx_2d = dy_2d @ w_2d.T
-    dx = dx_2d.reshape(input_shape)
+
+    # dx = dy @ W^T
+    dx = (dy_2d @ w_2d.T).reshape(input_shape)
+
+    # dW = x^T @ dy
+    dw = (x_2d.T @ dy_2d).reshape(1, 1, in_width, unit)
 
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "wb") as f:
-        # 1. Initial weights (weight is trainable by default in LmHead)
+        # 1. Initial weights (trainable)
         write_tensor(f, weight)
         # 2. Inputs
         write_tensor(f, x)
         # 3. Outputs
         write_tensor(f, output)
-        # 4. Gradients (weight gradient: dW = x^T @ dy)
-        dw_2d = x_2d.T @ dy_2d
-        dw = dw_2d.reshape(1, 1, in_width, unit)
+        # 4. Gradients
         write_tensor(f, dw)
-        # 5. Weights (unchanged - no optimizer step)
+        # 5. Weights (unchanged — no optimizer step)
         write_tensor(f, weight)
         # 6. Derivatives
         write_tensor(f, dx)
@@ -165,29 +160,23 @@ def gen_swiglu_golden(input_shape=(2, 1, 1, 10),
     Two inputs: gate (input_idx=0), up (input_idx=1)
 
     Backward (incoming_deriv = 2.0):
-    d_up = swish(gate) * dy
+    d_up   = swish(gate) * dy
     d_gate = up * swish'(gate) * dy
     where swish'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
     """
-    # Inputs (no weights for SwiGLU)
     gate = rand_input(input_shape)
-    up = rand_input(input_shape)
+    up   = rand_input(input_shape)
 
     # Forward
     sigmoid_gate = 1.0 / (1.0 + np.exp(-gate))
-    swish_gate = gate * sigmoid_gate
-    output = swish_gate * up
+    swish_gate   = gate * sigmoid_gate
+    output       = swish_gate * up
 
     # Backward: incoming_deriv = 2.0
     incoming_deriv = np.full_like(output, 2.0)
-
-    # d_up = swish(gate) * dy
-    d_up = swish_gate * incoming_deriv
-
-    # swish'(gate) = sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate))
-    swish_prime = sigmoid_gate + gate * sigmoid_gate * (1.0 - sigmoid_gate)
-    # d_gate = up * swish'(gate) * dy
-    d_gate = up * swish_prime * incoming_deriv
+    d_up           = swish_gate * incoming_deriv
+    swish_prime    = sigmoid_gate + gate * sigmoid_gate * (1.0 - sigmoid_gate)
+    d_gate         = up * swish_prime * incoming_deriv
 
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "wb") as f:
@@ -221,27 +210,30 @@ def gen_tie_word_embedding_golden(input_shape=(2, 1, 1, 10), unit=5,
 
     Backward (incoming_deriv = 2.0):
     dx = dy @ weight  (since forward was input @ weight^T)
+    dW = dy^T @ x
     """
     in_width = input_shape[-1]
 
-    # Weight: shape (1, 1, unit, in_width) — note: transposed vs LmHead
+    # Weight: (1, 1, unit, in_width) — transposed vs LmHead
     weight = rand_input((1, 1, unit, in_width))
 
     # Input
     x = rand_input(input_shape)
 
     # Forward: output = x @ weight^T
-    x_2d = x.reshape(-1, in_width)
-    w_2d = weight.reshape(unit, in_width)  # (unit, in_width)
-    out_2d = x_2d @ w_2d.T  # (batch, unit)
-    output = out_2d.reshape(input_shape[0], 1, 1, unit)
+    x_2d   = x.reshape(-1, in_width)
+    w_2d   = weight.reshape(unit, in_width)
+    output = (x_2d @ w_2d.T).reshape(input_shape[0], 1, 1, unit)
 
     # Backward: incoming_deriv = 2.0
     incoming_deriv = np.full_like(output, 2.0)
-    # dx = dy @ weight (not transposed, since forward used weight^T)
     dy_2d = incoming_deriv.reshape(-1, unit)
-    dx_2d = dy_2d @ w_2d  # (batch, in_width)
-    dx = dx_2d.reshape(input_shape)
+
+    # dx = dy @ weight (no transpose — forward used weight^T)
+    dx = (dy_2d @ w_2d).reshape(input_shape)
+
+    # dW = dy^T @ x
+    dw = (dy_2d.T @ x_2d).reshape(1, 1, unit, in_width)
 
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "wb") as f:
@@ -251,9 +243,7 @@ def gen_tie_word_embedding_golden(input_shape=(2, 1, 1, 10), unit=5,
         write_tensor(f, x)
         # 3. Outputs
         write_tensor(f, output)
-        # 4. Gradients (weight gradient: dW = (x^T @ dy)^T = dy^T @ x for transposed weight)
-        dw_2d = dy_2d.T @ x_2d  # (unit, in_width)
-        dw = dw_2d.reshape(1, 1, unit, in_width)
+        # 4. Gradients
         write_tensor(f, dw)
         # 5. Weights (unchanged)
         write_tensor(f, weight)
@@ -264,6 +254,91 @@ def gen_tie_word_embedding_golden(input_shape=(2, 1, 1, 10), unit=5,
     print(f"  input shape: {x.shape}, weight shape: {weight.shape}")
     print(f"  output shape: {output.shape}")
     print(f"  derivative sample: {dx.flat[:5]}")
+
+    return filepath
+
+
+def gen_embedding_layer_golden(input_shape=(2, 1, 1, 10), in_dim=100, out_dim=10,
+                               filename="causallm_embedding_layer.nnlayergolden"):
+    """Generate golden data for CausalLM EmbeddingLayer with backward pass.
+
+    EmbeddingLayer forward:
+      For each token ID in the input, look up its row in the weight table.
+      output[b, 0, i, :] = weight[0, 0, token_id, :]
+
+    Input shape:  (batch, 1, 1, seq_len)
+                  channel must be 1 — layer throws otherwise
+                  width = seq_len — becomes output height per C++ finalize()
+    Weight shape: (1, 1, in_dim, out_dim)
+    Output shape: (batch, 1, seq_len, out_dim)
+
+    in_dim=100 is safely above rand_input's [0,10) range so no out-of-bounds
+    throws in the C++ layer.
+
+    Backward (incoming_deriv = 2.0):
+      Scatter-add: dweight[token_id, :] += incoming_deriv[position, :]
+      Tokens appearing multiple times accumulate gradient.
+      calcDerivative is a no-op — embedding is the first layer.
+
+    C++ layer properties to set before finalize():
+      in_dim=100, out_dim=10
+    """
+    batch   = input_shape[0]
+    seq_len = input_shape[3]  # width becomes seq_len per C++ finalize()
+
+    # Weight table: (1, 1, in_dim, out_dim)
+    # rand_input keeps weights consistent with all other generators
+    weight = rand_input((1, 1, in_dim, out_dim))
+
+    # Token IDs: rand_input gives [0,10) which is always < in_dim=100
+    # No clip needed, no out-of-bounds possible
+    x = rand_input(input_shape)
+
+    # Forward: table lookup
+    # output shape: (batch, 1, seq_len, out_dim)
+    output = np.zeros((batch, 1, seq_len, out_dim), dtype=np.float32)
+    for b in range(batch):
+        for i in range(seq_len):
+            idx = int(x[b, 0, 0, i])
+            output[b, 0, i, :] = weight[0, 0, idx, :]
+
+    # Backward: incoming_deriv = 2.0
+    incoming_deriv = np.full_like(output, 2.0)
+
+    # Weight gradient: scatter-add
+    # dweight[token_id, :] += incoming_deriv[position, :]
+    # Same token appearing multiple times accumulates — matches C++ calcGradient
+    dweight = np.zeros_like(weight)
+    for b in range(batch):
+        for i in range(seq_len):
+            idx = int(x[b, 0, 0, i])
+            dweight[0, 0, idx, :] += incoming_deriv[b, 0, i, :]
+
+    # calcDerivative is empty in C++ — embedding is the first layer.
+    # Write zeros so the test framework stream stays aligned.
+    d_input = np.zeros_like(x)
+
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    with open(filepath, "wb") as f:
+        # 1. Initial weights
+        write_tensor(f, weight)
+        # 2. Inputs (token IDs as float32)
+        write_tensor(f, x)
+        # 3. Outputs
+        write_tensor(f, output)
+        # 4. Gradients (embedding table IS trainable)
+        write_tensor(f, dweight)
+        # 5. Weights (unchanged — no optimizer step in golden)
+        write_tensor(f, weight)
+        # 6. Derivatives (zeros — no gradient flows back through token IDs)
+        write_tensor(f, d_input)
+
+    print(f"Generated: {filepath}")
+    print(f"  input shape:    {x.shape}      (token IDs, values in [0,10))")
+    print(f"  weight shape:   {weight.shape}  (in_dim={in_dim}, out_dim={out_dim})")
+    print(f"  output shape:   {output.shape}")
+    print(f"  dweight sample: {dweight.flat[:5]}")
+    print(f"  unique tokens:  {sorted(set(int(v) for v in x.flat))}")
 
     return filepath
 
@@ -284,17 +359,17 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
     only at the final output to match C++ float32 results within tolerance.
     """
     gqa_size = num_heads_q // num_heads_kv
-    q_width = num_heads_q * head_dim
+    q_width  = num_heads_q * head_dim
     kv_width = num_heads_kv * head_dim
     half_dim = head_dim // 2
 
     # Compute RoPE frequencies matching C++ _compute_default_parameters exactly
-    # C++: thetas[i] = float(1.0 / pow(theta, 2*i / float(head_dim)))
     thetas = np.zeros(half_dim, dtype=np.float32)
     for i in range(half_dim):
         exponent = np.float32(np.float32(2 * i) / np.float32(head_dim))
-        base_pow = np.float32(np.float64(1.0) / np.float64(np.float32(rope_theta) ** np.float32(exponent)))
-        thetas[i] = base_pow
+        thetas[i] = np.float32(
+            np.float64(1.0) /
+            np.float64(np.float32(rope_theta) ** np.float32(exponent)))
 
     # Compute cos/sin tables in float32 matching C++
     cos_table = np.zeros((seq_len, half_dim), dtype=np.float32)
@@ -305,26 +380,26 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
             cos_table[pos, j] = np.float32(np.cos(np.float64(angle)))
             sin_table[pos, j] = np.float32(np.sin(np.float64(angle)))
 
-    # Use float64 versions for attention computation (higher precision reference)
-    cos_table_f64 = cos_table.astype(np.float64)
-    sin_table_f64 = sin_table.astype(np.float64)
-
     def apply_rope(x, cos_t, sin_t):
-        """Apply RoPE. Compute in float32 per-element matching C++ scalar loop."""
-        x = x.astype(np.float32)
-        x1 = x[:half_dim]
-        x2 = x[half_dim:]
-        out1 = (x1 * cos_t.astype(np.float32) - x2 * sin_t.astype(np.float32)).astype(np.float32)
-        out2 = (x1 * sin_t.astype(np.float32) + x2 * cos_t.astype(np.float32)).astype(np.float32)
+        """Apply RoPE in float32 per-element matching C++ scalar loop."""
+        x    = x.astype(np.float32)
+        x1   = x[:half_dim]
+        x2   = x[half_dim:]
+        out1 = (x1 * cos_t.astype(np.float32) -
+                x2 * sin_t.astype(np.float32)).astype(np.float32)
+        out2 = (x1 * sin_t.astype(np.float32) +
+                x2 * cos_t.astype(np.float32)).astype(np.float32)
         return np.concatenate([out1, out2]).astype(np.float32)
 
     def apply_inverse_rope(x, cos_t, sin_t):
-        """Apply inverse RoPE. Compute in float32 matching C++."""
-        x = x.astype(np.float32)
-        x1 = x[:half_dim]
-        x2 = x[half_dim:]
-        out1 = (x1 * cos_t.astype(np.float32) + x2 * sin_t.astype(np.float32)).astype(np.float32)
-        out2 = (-x1 * sin_t.astype(np.float32) + x2 * cos_t.astype(np.float32)).astype(np.float32)
+        """Apply inverse RoPE in float32. R^-1 = R^T: same cos, negated sin."""
+        x    = x.astype(np.float32)
+        x1   = x[:half_dim]
+        x2   = x[half_dim:]
+        out1 = (x1 * cos_t.astype(np.float32) +
+                x2 * sin_t.astype(np.float32)).astype(np.float32)
+        out2 = (-x1 * sin_t.astype(np.float32) +
+                x2 * cos_t.astype(np.float32)).astype(np.float32)
         return np.concatenate([out1, out2]).astype(np.float32)
 
     # Inputs
@@ -332,63 +407,59 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
     K = rand_input((batch, 1, seq_len, kv_width))
     V = rand_input((batch, 1, seq_len, kv_width))
 
-    # Forward pass
-    # 1. Apply RoPE to Q and K (element-by-element matching C++)
+    # Forward: apply RoPE to Q and K
     Q_rope = Q.copy()
     K_rope = K.copy()
     for b in range(batch):
         for h in range(seq_len):
             for n in range(num_heads_q):
                 offset = n * head_dim
-                Q_rope[b, 0, h, offset:offset+head_dim] = apply_rope(
-                    Q[b, 0, h, offset:offset+head_dim],
+                Q_rope[b, 0, h, offset:offset + head_dim] = apply_rope(
+                    Q[b, 0, h, offset:offset + head_dim],
                     cos_table[h], sin_table[h])
             for n in range(num_heads_kv):
                 offset = n * head_dim
-                K_rope[b, 0, h, offset:offset+head_dim] = apply_rope(
-                    K[b, 0, h, offset:offset+head_dim],
+                K_rope[b, 0, h, offset:offset + head_dim] = apply_rope(
+                    K[b, 0, h, offset:offset + head_dim],
                     cos_table[h], sin_table[h])
 
-    # 2. Reshape to per-head (float64 for precise attention computation)
-    Q_heads = Q_rope.reshape(batch, seq_len, num_heads_q, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
-    K_heads = K_rope.reshape(batch, seq_len, num_heads_kv, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
-    V_heads = V.reshape(batch, seq_len, num_heads_kv, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
+    # Reshape to per-head layout (float64 for precise attention)
+    Q_heads = Q_rope.reshape(
+        batch, seq_len, num_heads_q, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
+    K_heads = K_rope.reshape(
+        batch, seq_len, num_heads_kv, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
+    V_heads = V.reshape(
+        batch, seq_len, num_heads_kv, head_dim).transpose(0, 2, 1, 3).astype(np.float64)
 
-    # 3. Compute attention per Q head with GQA (all in float64)
-    scale = 1.0 / np.sqrt(float(head_dim))
-    output = np.zeros((batch, num_heads_q, seq_len, head_dim), dtype=np.float64)
+    # Attention per Q head with GQA
+    attn_scale   = 1.0 / np.sqrt(float(head_dim))
+    output       = np.zeros((batch, num_heads_q, seq_len, head_dim), dtype=np.float64)
     attn_weights = np.zeros((batch, num_heads_q, seq_len, seq_len), dtype=np.float64)
-
-    NEG_FLT_MAX = float(-np.finfo(np.float32).max)
+    NEG_FLT_MAX  = float(-np.finfo(np.float32).max)
 
     for b in range(batch):
         for q_head in range(num_heads_q):
             kv_head = q_head // gqa_size
-            q_h = Q_heads[b, q_head]
-            k_h = K_heads[b, kv_head]
-            scores = q_h @ k_h.T * scale
+            scores  = Q_heads[b, q_head] @ K_heads[b, kv_head].T * attn_scale
 
             if is_causal:
                 for i in range(seq_len):
                     for j in range(i + 1, seq_len):
                         scores[i, j] = NEG_FLT_MAX
 
-            # Softmax
-            scores_max = np.max(scores, axis=-1, keepdims=True)
-            scores_exp = np.exp(scores - scores_max)
-            attn_w = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
+            scores_exp        = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
+            attn_w            = scores_exp / np.sum(scores_exp, axis=-1, keepdims=True)
             attn_weights[b, q_head] = attn_w
-            output[b, q_head] = attn_w @ V_heads[b, kv_head]
+            output[b, q_head]       = attn_w @ V_heads[b, kv_head]
 
-    # Reshape output and cast to float32
-    output_flat = output.transpose(0, 2, 1, 3).reshape(batch, 1, seq_len, q_width).astype(np.float32)
+    output_flat = output.transpose(0, 2, 1, 3).reshape(
+        batch, 1, seq_len, q_width).astype(np.float32)
 
-    # Backward pass (incoming derivative = 2.0, in float64)
+    # Backward (incoming_deriv = 2.0)
     d_out_heads = np.full((batch, num_heads_q, seq_len, head_dim), 2.0, dtype=np.float64)
-
-    d_Q_heads = np.zeros_like(Q_heads)  # float64
-    d_K_heads = np.zeros((batch, num_heads_kv, seq_len, head_dim), dtype=np.float64)
-    d_V_heads = np.zeros((batch, num_heads_kv, seq_len, head_dim), dtype=np.float64)
+    d_Q_heads   = np.zeros_like(Q_heads)
+    d_K_heads   = np.zeros((batch, num_heads_kv, seq_len, head_dim), dtype=np.float64)
+    d_V_heads   = np.zeros((batch, num_heads_kv, seq_len, head_dim), dtype=np.float64)
 
     for b in range(batch):
         for kv_head in range(num_heads_kv):
@@ -398,27 +469,25 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
             for g in range(gqa_size):
                 q_head = kv_head * gqa_size + g
                 attn_w = attn_weights[b, q_head]
-                d_out = d_out_heads[b, q_head]
-                v_h = V_heads[b, kv_head]
-                q_h = Q_heads[b, q_head]
-                k_h = K_heads[b, kv_head]
+                d_out  = d_out_heads[b, q_head]
 
-                d_attn = d_out @ v_h.T
+                d_attn   = d_out @ V_heads[b, kv_head].T
                 d_v_head += attn_w.T @ d_out
 
-                # Softmax backward
-                dot_sum = np.sum(d_attn * attn_w, axis=-1, keepdims=True)
-                d_scores = attn_w * (d_attn - dot_sum) * scale
+                # Softmax backward: s*(d_attn - sum(d_attn*s))
+                dot_sum  = np.sum(d_attn * attn_w, axis=-1, keepdims=True)
+                d_scores = attn_w * (d_attn - dot_sum) * attn_scale
 
-                d_Q_heads[b, q_head] = d_scores @ k_h
-                d_k_head += d_scores.T @ q_h
+                d_Q_heads[b, q_head] = d_scores @ K_heads[b, kv_head]
+                d_k_head            += d_scores.T @ Q_heads[b, q_head]
 
             d_K_heads[b, kv_head] = d_k_head
             d_V_heads[b, kv_head] = d_v_head
 
-    # Reshape and cast to float32
-    d_Q_flat = d_Q_heads.transpose(0, 2, 1, 3).reshape(batch, 1, seq_len, q_width).astype(np.float32)
-    d_K_flat = d_K_heads.transpose(0, 2, 1, 3).reshape(batch, 1, seq_len, kv_width).astype(np.float32)
+    d_Q_flat = d_Q_heads.transpose(0, 2, 1, 3).reshape(
+        batch, 1, seq_len, q_width).astype(np.float32)
+    d_K_flat = d_K_heads.transpose(0, 2, 1, 3).reshape(
+        batch, 1, seq_len, kv_width).astype(np.float32)
 
     # Apply inverse RoPE to d_Q and d_K
     d_Q_out = d_Q_flat.copy()
@@ -427,21 +496,22 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
         for h in range(seq_len):
             for n in range(num_heads_q):
                 offset = n * head_dim
-                d_Q_out[b, 0, h, offset:offset+head_dim] = apply_inverse_rope(
-                    d_Q_flat[b, 0, h, offset:offset+head_dim],
+                d_Q_out[b, 0, h, offset:offset + head_dim] = apply_inverse_rope(
+                    d_Q_flat[b, 0, h, offset:offset + head_dim],
                     cos_table[h], sin_table[h])
             for n in range(num_heads_kv):
                 offset = n * head_dim
-                d_K_out[b, 0, h, offset:offset+head_dim] = apply_inverse_rope(
-                    d_K_flat[b, 0, h, offset:offset+head_dim],
+                d_K_out[b, 0, h, offset:offset + head_dim] = apply_inverse_rope(
+                    d_K_flat[b, 0, h, offset:offset + head_dim],
                     cos_table[h], sin_table[h])
 
-    # d_V doesn't need inverse RoPE (V was not rotated) — cast float64 to float32
-    d_V_out = d_V_heads.transpose(0, 2, 1, 3).reshape(batch, 1, seq_len, kv_width).astype(np.float32)
+    # d_V: V was not rotated so no inverse RoPE needed
+    d_V_out = d_V_heads.transpose(0, 2, 1, 3).reshape(
+        batch, 1, seq_len, kv_width).astype(np.float32)
 
     filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "wb") as f:
-        # 1. Initial weights (none - MHA Core has no trainable weights)
+        # 1. Initial weights (none — MHA Core has no trainable weights)
         # 2. Inputs (Q, K, V)
         write_tensor(f, Q)
         write_tensor(f, K)
@@ -465,81 +535,10 @@ def gen_mha_core_golden(batch=2, seq_len=4, num_heads_q=4, num_heads_kv=2,
     return filepath
 
 
-def gen_embedding_layer_golden(batch=2, seq_len=10, in_dim=100, out_dim=10,
-                              filename="causallm_embedding_layer.nnlayergolden"):
-    """Generate golden data for CausalLM Embedding Layer with backward pass.
-
-    Embedding forward: output = embedding_lookup(input_indices)
-    Weight shape: (1, 1, in_dim, out_dim)
-    Input: token indices [0, in_dim)
-    Output shape: (batch, 1, seq_len, out_dim)
-
-    Backward (incoming_deriv = 2.0):
-    dW[embed_idx] += dy[position]  (accumulate gradients for used embeddings)
-    No derivative to propagate back (discrete input).
-    """
-    # Initial weights: random weights for embedding
-    weight = np.random.randn(1, 1, in_dim, out_dim).astype(np.float32)
-
-    # Input: random integer token indices
-    x = rand_input((batch, 1, 1, seq_len))
-    # Ensure indices are within valid range
-    x = np.clip(x, 0, in_dim - 1).astype(np.int32).astype(np.float32)
-
-    # Forward pass: embedding lookup
-    # Reshape input for easy indexing
-    x_flat = x.reshape(-1).astype(np.int32)
-    output = np.zeros((batch, seq_len, out_dim), dtype=np.float32)
-    
-    for i in range(x_flat.size):
-        embed_idx = x_flat[i]
-        b = i // seq_len
-        s = i % seq_len
-        output[b, s, :] = weight[0, 0, embed_idx, :]
-
-    output = output.reshape(batch, 1, seq_len, out_dim)
-
-    # Backward pass: incoming_deriv = 2.0
-    incoming_deriv = np.full_like(output, 2.0)
-    
-    # Compute weight gradients
-    # dW[embed_idx] += dy[position]
-    dweight = np.zeros_like(weight)
-    
-    for i in range(x_flat.size):
-        embed_idx = x_flat[i]
-        b = i // seq_len
-        s = i % seq_len
-        dweight[0, 0, embed_idx, :] += incoming_deriv[b, 0, s, :]
-
-    # No derivative for input (discrete)
-
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    with open(filepath, "wb") as f:
-        # 1. Initial weights
-        write_tensor(f, weight)
-        # 2. Inputs
-        write_tensor(f, x)
-        # 3. Outputs
-        write_tensor(f, output)
-        # 4. Gradients (weight gradient)
-        write_tensor(f, dweight)
-        # 5. Weights (unchanged - no optimizer step)
-        write_tensor(f, weight)
-        # 6. Derivatives (none for embedding layer - no derivative to propagate back)
-
-    print(f"Generated: {filepath}")
-    print(f"  input shape: {x.shape}, weight shape: {weight.shape}")
-    print(f"  output shape: {output.shape}")
-    print(f"  weight gradient sample: {dweight.flat[:5]}")
-
-    return filepath
-
-
 if __name__ == "__main__":
     gen_rms_norm_golden()
     gen_lm_head_golden()
     gen_swiglu_golden()
     gen_tie_word_embedding_golden()
-    gen_mha_core_golden()
     gen_embedding_layer_golden()
+    gen_mha_core_golden()
