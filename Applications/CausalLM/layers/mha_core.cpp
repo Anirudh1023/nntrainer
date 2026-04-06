@@ -20,10 +20,10 @@
 
 static std::mutex rope_init_mtx;
 
+#include "mha_core.h"
 #include <engine.h>
 #include <fp16.h>
 #include <layer_context.h>
-#include <mha_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 
@@ -185,6 +185,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** Allocate training tensors for backward pass */
   if (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN) {
+    const unsigned int batch_size = query_dim.batch();
     const unsigned int seq_len = query_dim.height();
 
     // RoPE-applied Q: (batch, num_heads_Q, seq_len, head_dim)
@@ -208,7 +209,7 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       train_v_dim, "train_value", nntrainer::Initializer::NONE, false,
       nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 
-    // Attention weights: (batch*num_heads_Q, 1, seq_len, seq_len)
+    // Attention weights after softmax: (batch*num_heads_Q, 1, seq_len, seq_len)
     ml::train::TensorDim train_aw_dim(batch_size * num_heads_Q, 1, seq_len,
                                       seq_len, activation_type);
     tensor_idx[AttentionParams::train_attn_wt] = context.requestTensor(
@@ -221,12 +222,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
 /**
  * @note This forwarding function is used for training mode.
- *       Full-sequence attention without KV-cache.
+ *       This will be implemented ASAP.
+ * @date 2024-09-02
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+  printf("Entering Forwarding\n");
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
-
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
@@ -235,6 +237,7 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   const unsigned int batch_size = query.batch();
   const unsigned int seq_len = query.height();
 
+  // Get training cache tensors
   nntrainer::Tensor &train_q =
     context.getTensor(tensor_idx[AttentionParams::train_query]);
   nntrainer::Tensor &train_k =
@@ -244,7 +247,9 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &train_attn_wt =
     context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
 
-  // Step 1: Apply RoPE to clones (don't modify inputs)
+  // Step 1: Apply RoPE to copies of Q and K, then reshape to per-head format
+  // Must not modify input tensors (test framework checks inputs after forward)
+  // Copy Q and K, apply RoPE to copies
   nntrainer::Tensor q_rope = query.clone();
   nntrainer::Tensor k_rope = key.clone();
   apply_rotary_emb_tensor_v2(q_rope, q_rope, head_dim, 0, false);
@@ -285,12 +290,12 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 
   // Step 2: Compute attention for each batch and Q head
   float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
-
   for (unsigned int b = 0; b < batch_size; b++) {
     for (unsigned int q_head = 0; q_head < num_heads_Q; q_head++) {
       unsigned int kv_head = q_head / gqa_size;
       unsigned int flat_idx = b * num_heads_Q + q_head;
 
+      // Q_h: (1, 1, seq_len, head_dim) view
       nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
                                       query.getTensorType());
       nntrainer::Tensor q_h = train_q.getSharedDataTensor(
@@ -300,6 +305,7 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor v_h = train_v.getSharedDataTensor(
         head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
 
+      // scores = Q_h @ K_h^T: (1, 1, seq_len, seq_len)
       nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
                                      query.getTensorType());
       nntrainer::Tensor scores = train_attn_wt.getSharedDataTensor(
@@ -308,6 +314,7 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       q_h.dot(k_h, scores, false, true);
       scores.multiply_i(scale_factor);
 
+      // Apply causal mask: set upper triangle to -inf
       if (is_causal) {
         float *scores_data = scores.getData<float>();
         for (unsigned int i = 0; i < seq_len; i++) {
@@ -317,15 +324,22 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
         }
       }
 
+      // Softmax along last dimension
       sm.run_fn(scores, scores);
 
-      // attn_output = scores @ V_h, write directly to output
+      // attn_output = scores @ V_h: (1, 1, seq_len, head_dim)
+      nntrainer::TensorDim out_dim(1, 1, seq_len, head_dim,
+                                   query.getTensorType());
+
+      // Write directly to the output tensor at the right head offset
       float *out_base = output.getAddress<float>(b, 0, 0, 0);
       for (unsigned int h = 0; h < seq_len; h++) {
         float *attn_row = scores.getAddress<float>(0, 0, h, 0);
         float *v_data = v_h.getAddress<float>(0, 0, 0, 0);
-        float *out_row = out_base + h * (num_heads_Q * head_dim) +
-                         q_head * head_dim;
+        float *out_row =
+          out_base + h * (num_heads_Q * head_dim) + q_head * head_dim;
+
+        // out_row = sum_j(attn[h,j] * V[j,:])
         std::fill(out_row, out_row + head_dim, 0.0f);
         for (unsigned int j = 0; j < seq_len; j++) {
           float w = attn_row[j];
@@ -347,6 +361,8 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  /// @todo replace step_size into input height
+  unsigned int step_size = _to - _from;
 
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
@@ -360,6 +376,7 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       throw std::invalid_argument(
         "to shouldn't greater than max_timestep for initial forwarding");
     } else {
+      throw std::runtime_error("NYI: cache shift is not available");
       // exceeds the kv_cache size
       // KV_cache is shifted!
       cache_shift = true;
@@ -369,10 +386,10 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 
   // util fn to compute tensor dimension for one step.
-  auto get_step_dim = [to, from](const ml::train::TensorDim &dim) {
+  auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
     step_dim.batch(1);
-    step_dim.height(to - from); // One is expected.
+    step_dim.height(step_size);
     return step_dim;
   };
 
@@ -395,9 +412,6 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     sink = context.getWeight(sink_idx);
   }
 
-  const unsigned int num_heads_Q =
-    std::get<nntrainer::props::NumHeads>(mha_core_props).get();
-
   ml::train::TensorDim query_dim =
     query.getDim(); // (B, 1, seq_len, n_heads_Q * head_dim)
   ml::train::TensorDim key_dim =
@@ -407,23 +421,23 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim output_dim =
     output.getDim(); // (B, 1, seq_len, n_heads_Q * head_dim)
   ml::train::TensorDim cache_key_dim =
-    cache_key.getDim(); // (B, 1, max_seq_len, n_heads_KV * head_dim)
+    cache_key.getDim(); // (B, 1, max_timestep, n_heads_KV * head_dim)
   ml::train::TensorDim cache_value_dim =
-    cache_value.getDim(); // (B, 1, max_seq_len, n_heads_KV * head_dim)
+    cache_value.getDim(); // (B, 1, max_timestep, n_heads_KV * head_dim)
 
   ml::train::TensorDim query_step_dim =
-    get_step_dim(query_dim); // (B, 1, from-to, n_heads_Q * head_dim)
+    get_step_dim(query_dim); // (1, 1, step_size, n_heads_Q * head_dim)
   ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
   ml::train::TensorDim value_step_dim = get_step_dim(value_dim);
   ml::train::TensorDim output_step_dim =
-    get_step_dim(output_dim); // (B, 1, from-to, n_heads_Q * head_dim)
+    get_step_dim(output_dim); // (1, 1, step_size, n_heads_Q * head_dim)
   ml::train::TensorDim cache_key_step_dim =
-    get_step_dim(cache_key_dim); // (B, 1, from-to, n_heads_KV * head_dim)
+    get_step_dim(cache_key_dim); // (1, 1, step_size, n_heads_KV * head_dim)
 
   ml::train::TensorDim cache_value_step_dim =
-    get_step_dim(cache_value_dim); // (B, 1, from-to, n_heads_KV * head_dim)
+    get_step_dim(cache_value_dim); // (1, 1, step_size, n_heads_KV * head_dim)
 
-  unsigned int batch_size = (_from) ? 1 : query_dim.batch();
+  unsigned int batch_size = query_dim.batch();
   // do the incremental forwarding
   for (unsigned int batch = 0; batch < batch_size; ++batch) {
 
@@ -489,28 +503,8 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
   }
 
-  if (!_from) {
-    batch_size = query_dim.batch();
-    nntrainer::Tensor cache_key_0_step =
-      cache_key.getSharedDataTensor(cache_key_step_dim, 0, true);
-    nntrainer::Tensor cache_value_0_step =
-      cache_value.getSharedDataTensor(cache_value_step_dim, 0, true);
-
-    for (unsigned int batch = 1; batch < batch_size; ++batch) {
-      nntrainer::Tensor cache_key_nth_step = cache_key.getSharedDataTensor(
-        cache_key_step_dim,
-        batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(),
-        true);
-      nntrainer::Tensor cache_value_nth_step =
-        cache_key.getSharedDataTensor(cache_value_step_dim,
-                                      batch * cache_value_dim.getFeatureLen() +
-                                        from * cache_value_dim.width(),
-                                      true);
-
-      cache_key_nth_step.copyData(cache_key_0_step);
-      cache_key_nth_step.copyData(cache_value_0_step);
-    }
-  }
+  // increase cache size
+  cache_index += step_size;
 }
 
 /**
@@ -637,38 +631,41 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   ml::train::TensorDim &cache_value_step_dim) {
 
   /**
-   *  cache_key
-   *  +--------+                        ->
-   *  |        |                        ->
-   *  |        |                        ->
-   *  |........| from                   ->
-   *  |........| to -> b_cache_key_step -> b_cached_key
-   *  |        |
-   *  +--------+
    *
+   *  cache_key
+   *  +------------------------------------------+
+   *  |<--cache_index-->|<--b_cache_value_step-->|
+   *  +------------------------------------------+
+   *                    |<-------key_step------->|
+   *  |<-------------b_cached_key--------------->|
    */
 
-  /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
-   * **/
+  // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
   auto &pool =
     nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + from * cache_key_dim.width(), true);
-  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
-    cache_value_step_dim,
-    batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
+    batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
     true);
+  nntrainer::Tensor b_cache_value_step =
+    cache_value.getSharedDataTensor(cache_value_step_dim,
+                                    batch * cache_value_dim.getFeatureLen() +
+                                      cache_index * cache_value_dim.width(),
+                                    true);
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
-
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+  // apply rotary embedding for query
+  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                              false);
 
+  // append kcache with rotary embedding
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
+                             false);
+
+  // append vcache without rotary embedding
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim, _from,
-                               true);
+    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                               cache_index, true);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     b_cache_value_step.copyData(value_step);
@@ -677,33 +674,38 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif
   }
 
+  /// @todo replace step_size into input height
+  unsigned int step_size = to - from;
+  unsigned int cache_from = cache_index;
+  unsigned int cache_to = cache_from + step_size;
+
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
-  cached_key_dim.height(to);
-  cached_value_dim.height(to);
+  cached_key_dim.height(cache_to);
+  cached_value_dim.height(cache_to);
 
   nntrainer::Tensor b_cached_key = cache_key.getSharedDataTensor(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
+  // out_ stores the output of Q * K
   nntrainer::Tensor out_(
     1, 1,
-    is_causal
-      ? (((to - from) == 1) ? to : calc_attn_index(to) - calc_attn_index(from))
-      : ((to - from) * to),
+    is_causal ? (calc_attn_index(cache_to) - calc_attn_index(cache_from))
+              : (step_size * cache_to),
     num_heads_Q, query_step.getTensorType());
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  compute_kcaches(query_step, b_cached_key, out_, _from, to - from, num_heads_Q,
-                  gqa_size, head_dim, pool);
+  compute_kcaches(query_step, b_cached_key, out_, cache_from,
+                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim, pool);
 
-  softmax_triangle(out_, to - from, num_heads_Q, from, pool);
+  softmax_triangle(out_, step_size, num_heads_Q, cache_from, pool);
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                from, num_heads_KV, gqa_size, head_dim, to,
-                                pool);
+                                cache_from, num_heads_KV, gqa_size, head_dim,
+                                cache_to, pool);
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
@@ -715,6 +717,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   ml::train::TensorDim &cache_key_step_dim,
   ml::train::TensorDim &cache_value_dim,
   ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step) {
+  /// @todo replace from, to into cache_index, input height
+  /// @note currently, only gpt-oss uses this method
 
   /**
    *  cache_key
@@ -1438,13 +1442,15 @@ void MHACoreLayer::updateTensorsByInputDimensions(
 }
 
 void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  printf("Entering Derivative\n");
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
-
   const nntrainer::Tensor &incoming_deriv =
     context.getIncomingDerivative(INOUT_INDEX::OUTPUT);
-  nntrainer::Tensor &d_query = context.getOutgoingDerivative(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &d_query =
+    context.getOutgoingDerivative(INOUT_INDEX::QUERY);
   nntrainer::Tensor &d_key = context.getOutgoingDerivative(INOUT_INDEX::KEY);
-  nntrainer::Tensor &d_value = context.getOutgoingDerivative(INOUT_INDEX::VALUE);
+  nntrainer::Tensor &d_value =
+    context.getOutgoingDerivative(INOUT_INDEX::VALUE);
 
   nntrainer::Tensor &train_q =
     context.getTensor(tensor_idx[AttentionParams::train_query]);
@@ -1459,21 +1465,25 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const unsigned int seq_len = incoming_deriv.height();
   float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
+  // Temporary per-head tensors for gradient accumulation
   nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
                                   incoming_deriv.getTensorType());
   nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
                                  incoming_deriv.getTensorType());
 
+  // Allocate per-head gradient buffers for KV (accumulated across Q head group)
   nntrainer::Tensor d_k_head(head_dim_t, true);
   nntrainer::Tensor d_v_head(head_dim_t, true);
   nntrainer::Tensor d_scores(score_dim, true);
   nntrainer::Tensor d_out_head(head_dim_t, true);
 
+  // Initialize output gradients to zero
   d_query.setValue(0.0f);
   d_key.setValue(0.0f);
   d_value.setValue(0.0f);
 
   for (unsigned int b = 0; b < batch_size; b++) {
+    // Process per KV head group
     for (unsigned int kv_head = 0; kv_head < num_heads_KV; kv_head++) {
       d_k_head.setValue(0.0f);
       d_v_head.setValue(0.0f);
@@ -1492,6 +1502,8 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
         nntrainer::Tensor attn_wt = train_attn_wt.getSharedDataTensor(
           score_dim, flat_idx * seq_len * seq_len);
 
+        // Extract d_output for this head from incoming_deriv
+        // incoming_deriv: (B, 1, seq_len, H_Q*D)
         const float *in_deriv_base =
           incoming_deriv.getAddress<float>(b, 0, 0, 0);
         float *d_out_data = d_out_head.getData<float>();
@@ -1501,19 +1513,31 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
           std::copy(src, src + head_dim, d_out_data + h * head_dim);
         }
 
-        // d_attn_weights = d_output @ V^T
+        // d_attn_weights = d_output @ V^T: (seq_len, seq_len)
         d_out_head.dot(v_h, d_scores, false, true);
 
-        // d_V += attn_weights^T @ d_output (beta=1.0 accumulates)
+        // d_V += attn_weights^T @ d_output: (seq_len, head_dim)
+        // beta=1.0 to accumulate across Q heads in the group
         attn_wt.dot(d_out_head, d_v_head, true, false, 1.0f);
 
-        // Softmax backward via built-in softmaxPrime
-        sm.run_prime_fn(attn_wt, d_scores, d_scores);
+        // Softmax backward: d_scores_pre_softmax = softmax' * d_scores
+        // dL/dX_i = Y_i * (dL/dY_i - sum(Y_j * dL/dY_j)) * scale_factor
+        float *aw_ptr = attn_wt.getData<float>();
+        float *ds_ptr = d_scores.getData<float>();
+        for (unsigned int i = 0; i < seq_len; i++) {
+          float dot_sum = 0.0f;
+          for (unsigned int j = 0; j < seq_len; j++) {
+            dot_sum += aw_ptr[i * seq_len + j] * ds_ptr[i * seq_len + j];
+          }
+          for (unsigned int j = 0; j < seq_len; j++) {
+            float y = aw_ptr[i * seq_len + j];
+            float dy = ds_ptr[i * seq_len + j];
+            ds_ptr[i * seq_len + j] = y * (dy - dot_sum) * scale_factor;
+          }
+        }
 
-        // Scale
-        d_scores.multiply_i(scale_factor);
-
-        // d_Q for this head: d_scores @ K
+        // d_Q for this head: d_scores @ K: (seq_len, head_dim)
+        // Write directly into d_query
         float *dq_base = d_query.getAddress<float>(b, 0, 0, 0);
         float *ds_data = d_scores.getData<float>();
         float *k_data = k_h.getData<float>();
@@ -1529,7 +1553,8 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
           }
         }
 
-        // d_K += d_scores^T @ Q
+        // d_K += d_scores^T @ Q: accumulate
+        // d_K[j,d] += sum_i(d_scores[i,j] * Q[i,d])
         float *dk_data = d_k_head.getData<float>();
         float *q_data = q_h.getData<float>();
         for (unsigned int j = 0; j < seq_len; j++) {
@@ -1544,7 +1569,7 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
         }
       }
 
-      // Write accumulated d_K and d_V
+      // Write accumulated d_K and d_V into d_key and d_value
       float *dk_base = d_key.getAddress<float>(b, 0, 0, 0);
       float *dv_base = d_value.getAddress<float>(b, 0, 0, 0);
       float *dk_data = d_k_head.getData<float>();
@@ -1560,12 +1585,14 @@ void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
     }
   }
 
+  // Apply inverse RoPE to d_query and d_key
   apply_inverse_rotary_emb(d_query, head_dim, 0);
   apply_inverse_rotary_emb(d_key, head_dim, 0);
 }
 
 void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  // MHA Core has no trainable weights
+  // MHA Core has no trainable weights (Q/K/V/O projections are separate FC
+  // layers)
 }
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
@@ -1578,6 +1605,8 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, mha_core_props);
   LayerImpl::setProperty(remain_props);
 }
+
+size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
 
 void MHACoreLayer::apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
                                             unsigned int dim,
@@ -1593,6 +1622,9 @@ void MHACoreLayer::apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
     }
   }
 
+  // Inverse RoPE: rotate by -θ
+  // out_first_half  = in_first_half * cos(θ) + in_second_half * sin(θ)
+  // out_second_half = -in_first_half * sin(θ) + in_second_half * cos(θ)
   for (unsigned int b = 0; b < tensor.batch(); b++) {
     for (unsigned int c = 0; c < tensor.channel(); c++) {
       for (unsigned int h = 0; h < tensor.height(); h++) {
@@ -1602,11 +1634,11 @@ void MHACoreLayer::apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
         std::vector<float> &cos_v = (*freqs_cos)[pos];
         std::vector<float> &sin_v = (*freqs_sin)[pos];
         float *ptr = tensor.getAddress<float>(b, c, h, 0);
-
         for (unsigned int w = 0; w < tensor.width(); w += dim) {
           for (unsigned int k = 0; k < half_; k++) {
             float a = ptr[w + k];
             float b_val = ptr[w + k + half_];
+            // Inverse rotation: transpose of rotation matrix
             ptr[w + k] = a * cos_v[k] + b_val * sin_v[k];
             ptr[w + k + half_] = -a * sin_v[k] + b_val * cos_v[k];
           }
@@ -1615,8 +1647,6 @@ void MHACoreLayer::apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
     }
   }
 }
-
-size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
 
 #ifdef PLUGGABLE
 
