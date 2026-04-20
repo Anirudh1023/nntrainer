@@ -392,20 +392,32 @@ public:
               if (K == 1) {
                 weight.save(file);
               } else {
-                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
-                  << "Q4_0 quantization requires both width and height to be "
-                     "divisible by 32, but got height="
-                  << K << ", width=" << N;
+                unsigned int padded_N = ((N + 31) / 32) * 32;
+                unsigned int padded_K = ((K + 31) / 32) * 32;
 
                 Tensor weight_t = weight.transpose("0:2:1");
-                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                
+                if (padded_N != N || padded_K != K) {
+                  Tensor padded_weight_t = Tensor(dim.batch(), dim.channel(), padded_N, padded_K, {Tformat::NCHW, TensorDim::DataType::FP32});
+                  padded_weight_t.setZero();
+                  
+                  float *dst = padded_weight_t.getData<float>();
+                  const float *src = weight_t.getData<float>();
+                  // Copy existing unpadded weights mapped sequentially
+                  for (unsigned int i = 0; i < N; ++i) {
+                    std::copy(src + i * K, src + i * K + K, dst + i * padded_K);
+                  }
+                  weight_t = padded_weight_t;
+                }
+
+                Tensor quant_weight(dim.batch(), dim.channel(), padded_K, padded_N,
                                     {Tformat::NCHW, dtype});
                 std::vector<char> tmp(quant_weight.size());
 
-                quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
+                quantize_q4_0(weight_t.getData<float>(), tmp.data(), padded_N, padded_K,
                               nullptr);
                 repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                            quant_weight.size(), N, K);
+                            quant_weight.size(), padded_N, padded_K);
                 quant_weight.save(file);
               }
             } else {

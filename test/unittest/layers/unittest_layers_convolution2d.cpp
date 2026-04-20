@@ -188,6 +188,18 @@ auto conv2d_mb_same_dilation = LayerGoldenTestParamType(
   "3:3:11:11", "conv2d_mb_same_dilation.nnlayergolden",
   LayerGoldenTestParamOptions::DEFAULT, "nchw", "fp32", "fp32");
 
+auto conv2d_sb_minimum_q4_0 = LayerGoldenTestParamType(
+  nntrainer::createLayer<nntrainer::Conv2DLayer>,
+  {"filters=3", "kernel_size=2,2"}, "1:1:4:4",
+  "conv2d_sb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT,
+  "nchw", "q4_0", "fp32");
+
+auto conv2d_mb_minimum_q4_0 = LayerGoldenTestParamType(
+  nntrainer::createLayer<nntrainer::Conv2DLayer>,
+  {"filters=3", "kernel_size=2,2"}, "3:1:4:4",
+  "conv2d_mb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT,
+  "nchw", "q4_0", "fp32");
+
 GTEST_PARAMETER_TEST(
   Convolution2D, LayerGoldenTest,
   ::testing::Values(
@@ -198,6 +210,10 @@ GTEST_PARAMETER_TEST(
     conv2d_mb_valid_drop_last, conv2d_sb_no_overlap, conv2d_mb_no_overlap,
     conv2d_sb_1x1_kernel, conv2d_mb_1x1_kernel, conv2d_sb_dilation,
     conv2d_mb_dilation, conv2d_sb_same_dilation, conv2d_mb_same_dilation));
+
+GTEST_PARAMETER_TEST(
+  Convolution2DQ4, LayerGoldenTest,
+  ::testing::Values(conv2d_sb_minimum_q4_0, conv2d_mb_minimum_q4_0));
 
 #ifdef ENABLE_FP16
 auto conv2d_sb_minimum_w16a16 = LayerGoldenTestParamType(
