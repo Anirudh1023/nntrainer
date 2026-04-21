@@ -26,14 +26,15 @@ class AbstractTransLayer(K.layers.Layer):
     def __init__(self, tf_layer, *args, **kwargs):
         if not isinstance(tf_layer, K.layers.Layer):
             raise ValueError("tf_layer must be type of keras layer")
-        super().__init__(*args, **kwargs, name=tf_layer.name + "/translated")
+        super().__init__(*args, **kwargs, name=tf_layer.name + "_translated")
         self.tf_layer = tf_layer
         self.call.__func__.__signature__ = signature(self.tf_layer.call)
         self.has_training = "training" in inspect.getfullargspec(self.call).args
 
     def build(self, input_shape):
         if not self.built:
-            self.tf_layer.build(input_shape)
+            if not getattr(self.tf_layer, 'built', False):
+                self.tf_layer.build(input_shape)
             super().build(input_shape)
 
     ##

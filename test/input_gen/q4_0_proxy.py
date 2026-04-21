@@ -48,18 +48,91 @@ def constrain_to_q4_0(weights_array):
     
     return w_restored
 
-def record_single_q4_0(layer, input_shape, test_name, input_type='int'):
+def record_single_q4_0(layer, input_shape, test_name, call_args=None, input_type='int'):
     """ Custom recorder wrapper fixing Q4 precision """
-    # 1. We must mock the layer build to initialize FP32 variables first
-    # (assuming standard tensorflow.keras setup)
+    if call_args is None:
+        call_args = {}
+        
+    from recorder import attach_trans_layer, _rand_like, _get_writer
+    import tensorflow as tf
+    
+    # 1. We must mock the layer build securely via the standard layer translation struct
+    layer = attach_trans_layer(layer)
     layer.build(input_shape)
     
-    # 2. Extract FP32 weights, crush them through the GGML Q4_0 mathematical constraint, and inject them back
-    weights = layer.get_weights()
+    # 2. Extract FP32 weights, crush them through the GGML Q4_0 mathematical constraint, and precisely inject them back!
+    # Target the inner Keras layer directly because the TransLayer wrapper doesn't support set_weights.
+    weights = layer.tf_layer.get_weights()
     if len(weights) > 0:
         weights[0] = constrain_to_q4_0(weights[0])
-        layer.set_weights(weights)
+        layer.tf_layer.set_weights(weights)
         
-    # 3. Call standard record_single
-    from recorder import record_single
-    record_single(layer, input_shape, test_name, input_type=input_type)
+    # 3. Simulate identical record execution organically bypassing standard wrappers
+    if isinstance(input_shape, list):
+        inputs = [_rand_like(in_shape, 1, input_type) for in_shape in input_shape]
+    else:
+        inputs = _rand_like(input_shape, 1, input_type)
+
+    initial_weights = [tf.Variable(i) for i in layer.weights]
+
+    for _ in range(4):
+        layer.call(inputs, **call_args) # warm layer multiple times
+
+    with tf.GradientTape(persistent=True) as tape:
+        if isinstance(inputs, list):
+            list([tape.watch(inp) for inp in inputs])
+        else:
+            tape.watch(inputs)
+        outputs = layer.call(inputs, **call_args)
+        dy_constant = outputs * 2  # set incoming derivative to 2 instead of 1
+
+    weights_out = layer.weights.copy()
+    # Execute gradient explicitly on the base Keras Variables directly! 
+    # (Bypasses TF 2.16 Keras 3 `EagerTensor` missing `.trainable` attribute crash in wrapper `.trainable_weights`)
+    gradients = tape.gradient(dy_constant, layer.tf_layer.trainable_weights)
+    derivatives = tape.gradient(dy_constant, inputs)
+
+    try:
+        gradients = layer.to_nntr_trainable_weights(gradients)
+
+
+    def pad_layer_tensors(tensors):
+        out = []
+        for tensor in tensors:
+            v_np = tensor.numpy() if hasattr(tensor, 'numpy') else np.array(tensor)
+            if len(v_np.shape) == 4:
+                out_c, in_c, h, w_dim = v_np.shape
+                N = out_c
+                K = h * w_dim * in_c
+                padded_K = ((K + 31) // 32) * 32
+                padded_N = ((N + 31) // 32) * 32
+                if padded_K != K or padded_N != N:
+                    v_flat = np.reshape(v_np, (N, K))
+                    v_padded = np.pad(v_flat, ((0, padded_N - N), (0, padded_K - K)), mode='constant')
+                    # GGML naturally crushes memory bounds recursively iterating col-wise across K. 
+                    # NNTrainer's TensorDim reads sequentially contiguously over width natively.
+                    v_out = v_padded.T
+                    out.append(tf.convert_to_tensor(v_out))
+                    continue
+            out.append(tensor)
+        return out
+
+    initial_weights = pad_layer_tensors(initial_weights)
+    weights_out = pad_layer_tensors(weights_out)
+    gradients = pad_layer_tensors(gradients)
+
+    with open(test_name + ".nnlayergolden", "wb") as f:
+        writer = _get_writer(f)
+
+        def write_tensor(tensors):
+            if not isinstance(tensors, list):
+                tensors = [tensors]
+            for tensor in tensors:
+                writer(tf.size(tensor), tensor)
+
+        write_tensor(initial_weights)
+        write_tensor(inputs)
+        write_tensor(outputs)
+        write_tensor(gradients)
+        write_tensor(weights_out)
+        write_tensor(derivatives)

@@ -322,7 +322,7 @@ void sizeCheckedReadTensor(nntrainer::Tensor &t, std::ifstream &file,
 
       fp32_temp.read(file);
       nntrainer::GgmlQuantizer quantizer(nntrainer::QScheme::Q4_0);
-      t = quantizer.quantize(fp32_temp);
+      t = quantizer.quantize(fp32_temp, ml::train::TensorDim::DataType::Q4_0);
       return;
   }
 
