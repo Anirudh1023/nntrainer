@@ -290,6 +290,7 @@ static void im2col(const Tensor &in, const TensorDim &kdim,
 } // namespace
 
 enum ConvParams { weight, bias };
+enum ConvTensors { result_padded, tmp_out_padded };
 
 Conv2DLayer::Conv2DLayer(
   const std::array<unsigned int, CONV2D_DIM * 2> &padding_) :
@@ -299,6 +300,7 @@ Conv2DLayer::Conv2DLayer(
              std::array<props::Stride, CONV2D_DIM>(), props::Padding2D(),
              std::array<props::Dilation, CONV2D_DIM>()) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
+  tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void Conv2DLayer::finalize(InitLayerContext &context) {
@@ -391,6 +393,21 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
                   eff_in_width - padding[2] - kernel_size[1] > IM,
                 std::invalid_argument)
     << "Failed to initialize: Calculated patch end is over int max";
+
+  if (in_t_type.data_type == ml::train::TensorDim::DataType::Q4_0) {
+    unsigned int N = filter_size;
+    unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
+    unsigned int padded_N = ((N + 31) / 32) * 32;
+    unsigned int padded_K = ((K + 31) / 32) * 32;
+
+    if (padded_K != K) {
+      tensor_idx[ConvTensors::result_padded] = context.requestTensor(
+        TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_K, in_dim.getTensorType()), "result_padded");
+    }
+    
+    tensor_idx[ConvTensors::tmp_out_padded] = context.requestTensor(
+      TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_N, out_dim.getTensorType()), "tmp_out_padded");
+  }
 }
 
 void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
@@ -465,74 +482,59 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
    */
   auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
                             void *user_data) {
-    std::cerr << "[FWD_DBG] forwarding_job s=" << s << " e=" << e << std::endl;
     Tensor result = Tensor(calcCol2ImOutputDim(out_dim, original_filter_dim));
-    std::cerr << "[FWD_DBG] result dim=" << result.getDim().height() << "x" << result.getDim().width()
-              << " type=" << (int)result.getDataType() << std::endl;
     result.setZero();
     for (unsigned int b = s; b < e; ++b) {
       Tensor out = hidden_.getBatchSlice(b, 1);
       out.reshape({filter_size, out_dim.width() * out_dim.height()});
       Tensor in_sub = input_.getBatchSlice(b, 1);
 
-      std::cerr << "[FWD_DBG] im2col..." << std::endl;
       im2col(in_sub, original_filter_dim, padding, stride, dilation, result);
-      std::cerr << "[FWD_DBG] im2col done" << std::endl;
       
       if (filter_kernel.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
         unsigned int N = filter_size;
         unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
         unsigned int padded_N = ((N + 31) / 32) * 32;
         unsigned int padded_K = ((K + 31) / 32) * 32;
-        std::cerr << "[FWD_DBG] Q4_0 path: N=" << N << " K=" << K
-                  << " padded_N=" << padded_N << " padded_K=" << padded_K << std::endl;
         
-        Tensor result_padded = result; 
+        Tensor *result_padded_ptr = &result;
         if (padded_K != K) {
-           std::cerr << "[FWD_DBG] padding im2col K..." << std::endl;
-           result_padded = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_K, result.getTensorType()));
-           result_padded.setZero();
+           result_padded_ptr = &context.getTensor(tensor_idx[ConvTensors::result_padded]);
+           result_padded_ptr->setZero();
            
-           float* dst = result_padded.getData<float>();
+           float* dst = result_padded_ptr->getData<float>();
            const float* src = result.getData<float>();
            unsigned int rows = out_dim.width() * out_dim.height();
            for(unsigned int r = 0; r < rows; ++r) {
                std::copy(src + r * K, src + r * K + K, dst + r * padded_K);
            }
-           std::cerr << "[FWD_DBG] im2col padding done" << std::endl;
         }
         
-        std::cerr << "[FWD_DBG] creating tmp_out_padded..." << std::endl;
-        Tensor tmp_out_padded = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_N, out.getTensorType()));
-        std::cerr << "[FWD_DBG] calling dot..." << std::endl;
-        result_padded.dot(filter_kernel, tmp_out_padded, false, true);
-        std::cerr << "[FWD_DBG] dot done" << std::endl;
+        Tensor &tmp_out_padded = context.getTensor(tensor_idx[ConvTensors::tmp_out_padded]);
         
-        Tensor tmp_out;
+        result_padded_ptr->dot(filter_kernel, tmp_out_padded, false, true);
+        
+        Tensor *tmp_out_ptr = &tmp_out_padded;
+        Tensor tmp_out_allocated;
         if (padded_N != N) {
-           tmp_out = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), filter_size, out.getTensorType()));
-           float* dst = tmp_out.getData<float>();
+           tmp_out_allocated = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), filter_size, out.getTensorType()));
+           float* dst = tmp_out_allocated.getData<float>();
            const float* src = tmp_out_padded.getData<float>();
            unsigned int rows = out_dim.width() * out_dim.height();
            for(unsigned int r = 0; r < rows; ++r) {
                std::copy(src + r * padded_N, src + r * padded_N + N, dst + r * N);
            }
-        } else {
-           tmp_out = tmp_out_padded;
+           tmp_out_ptr = &tmp_out_allocated;
         }
-
-        // Manual transpose: tmp_out is (1,1,HW,N), out is (1,1,N,HW)
-        // out[n][hw] = tmp_out[hw][n]
-        std::cerr << "[FWD_DBG] manual transpose..." << std::endl;
+        
         float* out_data = out.getData<float>();
-        const float* tmp_data = tmp_out.getData<float>();
+        const float* tmp_data = tmp_out_ptr->getData<float>();
         unsigned int HW = out_dim.width() * out_dim.height();
         for (unsigned int n = 0; n < N; ++n) {
           for (unsigned int hw = 0; hw < HW; ++hw) {
             out_data[n * HW + hw] = tmp_data[hw * N + n];
           }
         }
-        std::cerr << "[FWD_DBG] manual transpose done" << std::endl;
       } else {
         // filter kernel is (K, CRS), result is (CRS, OH*OW)
         filter_kernel.dot(result, out, false, true);

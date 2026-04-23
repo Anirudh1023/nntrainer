@@ -116,6 +116,7 @@ private:
     conv_props;
 
   std::array<unsigned int, 5> wt_idx; /**< indices of the weights and tensors */
+  std::array<unsigned int, 2> tensor_idx; /**< indices of the dynamically padded tensors */
 };
 
 } // namespace nntrainer
