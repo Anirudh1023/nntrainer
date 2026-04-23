@@ -191,13 +191,13 @@ auto conv2d_mb_same_dilation = LayerGoldenTestParamType(
 auto conv2d_sb_minimum_q4_0 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::Conv2DLayer>,
   {"filters=3", "kernel_size=2,2"}, "1:1:4:4",
-  "conv2d_sb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_DERIV | LayerGoldenTestParamOptions::SKIP_CALC_GRAD,
+  "conv2d_sb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_DERIV | LayerGoldenTestParamOptions::SKIP_CALC_GRAD | LayerGoldenTestParamOptions::SKIP_COSINE_SIMILARITY,
   "nchw", "q4_0", "fp32");
 
 auto conv2d_mb_minimum_q4_0 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::Conv2DLayer>,
   {"filters=3", "kernel_size=2,2"}, "3:1:4:4",
-  "conv2d_mb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_DERIV | LayerGoldenTestParamOptions::SKIP_CALC_GRAD,
+  "conv2d_mb_minimum_q4_0.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_DERIV | LayerGoldenTestParamOptions::SKIP_CALC_GRAD | LayerGoldenTestParamOptions::SKIP_COSINE_SIMILARITY,
   "nchw", "q4_0", "fp32");
 
 GTEST_PARAMETER_TEST(

@@ -328,26 +328,33 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   auto in_t_type = in_dim.getTensorType();
   in_t_type.data_type = context.getWeightDataType();
 
-  TensorDim kernel_dim;
+  // Logical kernel dim is always the original shape — used for padding and
+  // output size computation.
+  TensorDim logical_kernel_dim(filter_size, in_dim.channel(),
+                               kernel_size[0], kernel_size[1], in_t_type);
+
+  // Storage kernel dim may differ for quantized types that need alignment.
+  TensorDim storage_kernel_dim;
   if (in_t_type.data_type == ml::train::TensorDim::DataType::Q4_0) {
     unsigned int N = filter_size;
     unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
     unsigned int padded_N = ((N + 31) / 32) * 32;
     unsigned int padded_K = ((K + 31) / 32) * 32;
-    kernel_dim = TensorDim(1, 1, padded_K, padded_N, in_t_type);
+    storage_kernel_dim = TensorDim(1, 1, padded_K, padded_N, in_t_type);
   } else {
-    kernel_dim = TensorDim(filter_size, in_dim.channel(),
-                           kernel_size[0], kernel_size[1], in_t_type);
+    storage_kernel_dim = logical_kernel_dim;
   }
 
-  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, in_t_type);
+  auto bias_t_type = in_t_type;
+  bias_t_type.data_type = ml::train::TensorDim::DataType::FP32;
+  TensorDim bias_dim = TensorDim(1, filter_size, 1, 1, bias_t_type);
 
   padding = std::get<props::Padding2D>(conv_props)
-              .compute(in_dim, kernel_dim, {stride[0], stride[1]},
+              .compute(in_dim, logical_kernel_dim, {stride[0], stride[1]},
                        {dilation[0], dilation[1]});
 
   wt_idx[ConvParams::weight] = context.requestWeight(
-    kernel_dim, weight_initializer, weight_regularizer,
+    storage_kernel_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "filter", true, 0);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
@@ -439,7 +446,9 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
   const TensorDim &out_dim = hidden_.getDim();
   const TensorDim &filter_dim = filter_kernel.getDim();
   auto &kernel_size = std::get<std::array<props::KernelSize, CONV2D_DIM>>(conv_props);
-  TensorDim original_filter_dim(filter_size, in_dim.channel(), kernel_size[0], kernel_size[1], filter_kernel.getTensorType());
+  auto original_filter_type = filter_kernel.getTensorType();
+  original_filter_type.data_type = ml::train::TensorDim::DataType::FP32;
+  TensorDim original_filter_dim(filter_size, in_dim.channel(), kernel_size[0], kernel_size[1], original_filter_type);
 
   if (filter_kernel.getDataType() != ml::train::TensorDim::DataType::Q4_0) {
     TensorDim filter_dim_squeezed{filter_kernel.batch(),
@@ -456,23 +465,31 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
    */
   auto forwarding_job = [&](unsigned int s, unsigned int e, unsigned int pid,
                             void *user_data) {
+    std::cerr << "[FWD_DBG] forwarding_job s=" << s << " e=" << e << std::endl;
     Tensor result = Tensor(calcCol2ImOutputDim(out_dim, original_filter_dim));
+    std::cerr << "[FWD_DBG] result dim=" << result.getDim().height() << "x" << result.getDim().width()
+              << " type=" << (int)result.getDataType() << std::endl;
     result.setZero();
     for (unsigned int b = s; b < e; ++b) {
       Tensor out = hidden_.getBatchSlice(b, 1);
       out.reshape({filter_size, out_dim.width() * out_dim.height()});
       Tensor in_sub = input_.getBatchSlice(b, 1);
 
+      std::cerr << "[FWD_DBG] im2col..." << std::endl;
       im2col(in_sub, original_filter_dim, padding, stride, dilation, result);
+      std::cerr << "[FWD_DBG] im2col done" << std::endl;
       
       if (filter_kernel.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
         unsigned int N = filter_size;
         unsigned int K = in_dim.channel() * kernel_size[0] * kernel_size[1];
         unsigned int padded_N = ((N + 31) / 32) * 32;
         unsigned int padded_K = ((K + 31) / 32) * 32;
+        std::cerr << "[FWD_DBG] Q4_0 path: N=" << N << " K=" << K
+                  << " padded_N=" << padded_N << " padded_K=" << padded_K << std::endl;
         
         Tensor result_padded = result; 
         if (padded_K != K) {
+           std::cerr << "[FWD_DBG] padding im2col K..." << std::endl;
            result_padded = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_K, result.getTensorType()));
            result_padded.setZero();
            
@@ -482,10 +499,14 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
            for(unsigned int r = 0; r < rows; ++r) {
                std::copy(src + r * K, src + r * K + K, dst + r * padded_K);
            }
+           std::cerr << "[FWD_DBG] im2col padding done" << std::endl;
         }
         
+        std::cerr << "[FWD_DBG] creating tmp_out_padded..." << std::endl;
         Tensor tmp_out_padded = Tensor(TensorDim(1, 1, out_dim.width() * out_dim.height(), padded_N, out.getTensorType()));
+        std::cerr << "[FWD_DBG] calling dot..." << std::endl;
         result_padded.dot(filter_kernel, tmp_out_padded, false, true);
+        std::cerr << "[FWD_DBG] dot done" << std::endl;
         
         Tensor tmp_out;
         if (padded_N != N) {
@@ -500,7 +521,18 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
            tmp_out = tmp_out_padded;
         }
 
-        tmp_out.transpose("0:2:1", out);
+        // Manual transpose: tmp_out is (1,1,HW,N), out is (1,1,N,HW)
+        // out[n][hw] = tmp_out[hw][n]
+        std::cerr << "[FWD_DBG] manual transpose..." << std::endl;
+        float* out_data = out.getData<float>();
+        const float* tmp_data = tmp_out.getData<float>();
+        unsigned int HW = out_dim.width() * out_dim.height();
+        for (unsigned int n = 0; n < N; ++n) {
+          for (unsigned int hw = 0; hw < HW; ++hw) {
+            out_data[n * HW + hw] = tmp_data[hw * N + n];
+          }
+        }
+        std::cerr << "[FWD_DBG] manual transpose done" << std::endl;
       } else {
         // filter kernel is (K, CRS), result is (CRS, OH*OW)
         filter_kernel.dot(result, out, false, true);
