@@ -522,6 +522,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.batch(1);   // per-batch slice
+  cached_value_dim.batch(1); // per-batch slice
   cached_key_dim.height(cache_to);
   cached_value_dim.height(cache_to);
 
@@ -604,6 +606,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
+  cached_key_dim.batch(1);   // per-batch slice
+  cached_value_dim.batch(1); // per-batch slice
   cached_key_dim.height(to);
   cached_value_dim.height(to);
 
@@ -1260,7 +1264,13 @@ void MHACoreLayer::updateTensorsByInputDimensions(
     std::get<props::MaxNewTokens>(mha_core_props).get();
   max_position_embeddings =
     std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
-  max_timestep = height + max_new_tokens;
+
+  // Only update max_timestep during prefill (height > 1).
+  // During decode steps (height == 1), keep the existing max_timestep so
+  // the KV cache is not shrunk and prefill-cached entries remain accessible.
+  if (height > 1) {
+    max_timestep = height + max_new_tokens;
+  }
 
   ml::train::TensorDim kv_dim = input_dimensions[0];
   kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));
@@ -1281,6 +1291,7 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
   context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
+
 
 void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
 

@@ -268,7 +268,7 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim, b * hidden_dim.getFeatureLen(), true);
+      input_step_dim, b * input_dim.getFeatureLen(), true);
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 

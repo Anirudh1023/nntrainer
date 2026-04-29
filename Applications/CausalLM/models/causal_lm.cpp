@@ -47,9 +47,11 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
 
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                json &nntr_cfg) {
-  // Initialize output list
-  for (unsigned int i = 0; i < BATCH_SIZE; ++i)
+  // Initialize output list and per-batch pending decode buffers
+  for (unsigned int i = 0; i < BATCH_SIZE; ++i) {
     output_list.push_back("");
+    pending_ids_.push_back(std::vector<int>());
+  }
 
   // allocate memory for the internal buffer
   ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
@@ -132,18 +134,22 @@ void CausalLM::registerOutputs(
   static const std::vector<char> puncts{',', '!', ':', ';', '?'};
   for (size_t b = 0; b < ids.size(); ++b) {
     if (!eos_list[b]) {
-      pending_ids_.push_back(static_cast<int>(ids[b]));
+      pending_ids_[b].push_back(static_cast<int>(ids[b]));
       ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
-      std::string decoded_str = tokenizer->Decode(pending_ids_);
+      std::string decoded_str = tokenizer->Decode(pending_ids_[b]);
 
-      if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
-          puncts.end()) {
+      if (decoded_str.empty()) {
+        // special or incomplete token — hold on
+      } else if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
+                 puncts.end()) {
         // last symbol is a punctuation, hold on
       } else if (decoded_str.size() >= 3 &&
                  decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
         // ends with an incomplete token, hold on
       } else {
-        if (log_output) {
+        // Batch 0 is streamed live to stdout so the user sees tokens as they
+        // are generated. All other batches accumulate silently in output_list.
+        if (log_output && b == 0) {
 #if defined(_WIN32)
           std::wcout << L"" << utf8_to_wstring(decoded_str);
           std::wcout.flush();
@@ -153,7 +159,7 @@ void CausalLM::registerOutputs(
 #endif
         }
         output_list[b].append(decoded_str);
-        pending_ids_.clear();
+        pending_ids_[b].clear();
       }
     }
   }
@@ -297,8 +303,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   has_run_ = false;
 
   output_list.clear();
+  pending_ids_.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     output_list.push_back("");
+    pending_ids_.push_back(std::vector<int>());
   }
 
   if (MAX_SEQ_LEN < INIT_SEQ_LEN) {
@@ -386,9 +394,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   unsigned int input_len = init_len;
   unsigned int token_generation_idx = input_len + 1;
 
+  // Tensor stride per batch = INIT_SEQ_LEN (the registered input height).
+  // MAX_SEQ_LEN is only the allocation size; the tensor maps INIT_SEQ_LEN per batch.
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     for (unsigned int i = 0; i < input_len; ++i) {
-      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+      input_sample[static_cast<size_t>(b) * INIT_SEQ_LEN + i] =
         static_cast<float>(init_input[i]);
       ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = init_input[i];
     }
@@ -452,9 +462,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                         SYS_PROMP_LEN,
                                         SYS_PROMP_LEN + input_len, false);
 
-  // post process of model output
-  std::vector<unsigned int> id_list(generate_multi_tokens(
-    output[0], NUM_VOCAB, BATCH_SIZE, 1, ids_history, _len));
+  // post process of model output — pick top-1 token per batch item
+  std::vector<unsigned int> id_list;
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    float *batch_logits = output[0] + static_cast<size_t>(b) * NUM_VOCAB;
+    unsigned int argmax = static_cast<unsigned int>(std::distance(
+      batch_logits, std::max_element(batch_logits, batch_logits + NUM_VOCAB)));
+    id_list.push_back(argmax);
+  }
 
   if (init_len < INIT_SEQ_LEN)
     registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
@@ -474,9 +489,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   input_len += SYS_PROMP_LEN;
 
-  // Update generated token by prefill as an input
+  // Write decode token at position 0 of each batch's INIT_SEQ_LEN slice.
+  // EmbeddingLayer reads in_data[0] = input_sample[b * INIT_SEQ_LEN].
   for (unsigned int b = 0; b < BATCH_SIZE; ++b)
-    input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+    input_sample[static_cast<size_t>(b) * INIT_SEQ_LEN] =
       static_cast<float>(id_list[b]);
 
   auto start_generation = std::chrono::high_resolution_clock::now();
@@ -492,16 +508,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
     if (token_generation_idx < input_len) {
       for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+        input_sample[static_cast<size_t>(b) * INIT_SEQ_LEN] =
           static_cast<float>(init_input[token_generation_idx - SYS_PROMP_LEN]);
       }
       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                       log_output);
     } else {
-      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
-        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+      // Write next decode token at position 0 of each batch's INIT_SEQ_LEN slice.
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        input_sample[static_cast<size_t>(b) * INIT_SEQ_LEN] =
           static_cast<float>(ids_list[b]);
-      }
       registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list,
                       log_output);
     }
@@ -547,9 +563,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   size_t peak_memory = getPeakMemoryKb();
 
   if (log_output) {
+    // Batch 0 was already streamed live. Print any additional batches
+    // now, each clearly labeled, so the user can compare outputs.
+    if (BATCH_SIZE > 1) {
+      std::cout << "\n\n--- [Batch 0 was streamed above] ---";
+      for (unsigned int b = 1; b < BATCH_SIZE; ++b) {
+        std::cout << "\n--- [Batch " << b << "] ---\n";
+        std::cout << output_list[b] << "\n";
+      }
+    }
 
-    std::cout << "\n\n";
-    std::cout << "=================[ LLM with NNTrainer ]===================\n";
+    std::cout << "\n=================[ LLM with NNTrainer ]===================\n";
     std::cout << "prefill: " << init_len << " tokens, "
               << prefill_duration.count() << " ms, "
               << ((double)init_len / prefill_duration.count() * 1000)

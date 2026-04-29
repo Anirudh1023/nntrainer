@@ -133,7 +133,7 @@ protected:
     output_list;             /**< List of output names for the model */
   unsigned int *ids_history; /**< History of input IDs for the model */
 
-  std::vector<int> pending_ids_;
+  std::vector<std::vector<int>> pending_ids_; /**< Per-batch pending token IDs for decoding */
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;
