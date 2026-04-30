@@ -279,8 +279,14 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     get_step_dim(cache_value_dim); // (1, 1, step_size, n_heads_KV * head_dim)
 
   unsigned int batch_size = query_dim.batch();
-  // do the incremental forwarding
-  for (unsigned int batch = 0; batch < batch_size; ++batch) {
+  // Parallelize over the batch axis: each batch independently reads/writes its
+  // own KV cache slice (offset by batch * getFeatureLen()). All local tensors
+  // (query_step, key_step, out_, etc.) are created inside the loop body and are
+  // therefore thread-local. cache_index and dim constants are read-only here.
+  // With OMP nested parallelism disabled (default), the inner OMP over KV heads
+  // inside compute_kcaches runs sequentially per batch thread — no oversubscription.
+#pragma omp parallel for schedule(static)
+  for (int batch = 0; batch < static_cast<int>(batch_size); ++batch) {
 
     // preparing step tensors
     nntrainer::Tensor query_step = query.getSharedDataTensor(

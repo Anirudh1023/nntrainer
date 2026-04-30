@@ -265,8 +265,29 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   if (hidden_dim.height() > 1)
     hidden_step_dim.height(to - from);
 
-  // @todo make it parallelized with batch axis
-  for (unsigned int b = 0; b < hidden_.batch(); ++b) {
+  unsigned int batch_size = hidden_.batch();
+  bool has_lora = !std::get<props::LoraRank>(fc_props).empty();
+
+  // Fast path: batched GEMM for decode phase (height==1) without LoRA.
+  // During decode, input_.getDim() = (B, 1, 1, K): all batch activations are
+  // laid out contiguously, so we can treat it as a single [B, K] matrix.
+  // dotFloat sees M=B > 1 and dispatches sgemm instead of B separate sgemv
+  // calls, reusing the weight matrix in cache across all batches at once.
+  if (batch_size > 1 && !has_lora && input_dim.height() == 1) {
+    input_.dot(weight, hidden_, false, false);
+
+    if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
+      // Bias is (1, 1, 1, N): add_i broadcasts over the batch dimension.
+      hidden_.add_i(bias);
+    }
+    return;
+  }
+
+  // General path: per-batch sequential loop.
+  // Used for: prefill (height > 1), batch == 1, or LoRA layers.
+  for (unsigned int b = 0; b < batch_size; ++b) {
     Tensor input_step = input_.getSharedDataTensor(
       input_step_dim, b * input_dim.getFeatureLen(), true);
     Tensor hidden_step = hidden_.getSharedDataTensor(
@@ -274,7 +295,7 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
     input_step.dot(weight, hidden_step, false, false);
 
-    if (!std::get<props::LoraRank>(fc_props).empty()) {
+    if (has_lora) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
       hidden_tmp_lora_step_dim.batch(1);
       if (hidden_tmp_lora_step_dim.height() > 1)
