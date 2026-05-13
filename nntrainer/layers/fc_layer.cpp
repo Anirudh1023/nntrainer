@@ -293,7 +293,74 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
-    input_step.dot(weight, hidden_step, false, false);
+    #ifdef ENABLE_FP16
+    // KleidiAI accelerated path for Q4_0 weights.
+    // On first call: unpack Q4_0, then pack into KAI's layout directly 
+    // BACK into the original weight memory buffer to save RAM (in-place).
+    if (weight.getDataType() == ml::train::TensorDim::DataType::Q4_0) {
+      const uint32_t K = weight.height();
+      const uint32_t N = weight.width();
+      const uint32_t kai_kernel_idx = 0; // neon_dotprod 1x4
+
+      if (!kai_packed_ready_) {
+        // Unpack to a temporary buffer
+        std::vector<uint8_t> unpacked(weight.getMemoryBytes());
+        unpack_q4_0((void *)weight.getData(), (void *)unpacked.data(),
+                    weight.getMemoryBytes(), N, K);
+
+        size_t packed_size = nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(
+          N, K, kai_kernel_idx, true);
+
+        // If it fits perfectly, overwrite the original tensor to save memory!
+        if (packed_size <= weight.getMemoryBytes()) {
+          nntr_qsi8d32p_qsi4c32p_rhs_pack(
+            N, K,
+            (void *)weight.getData(),     // dst: overwrite original memory
+            unpacked.data(),              // src: unpacked Q4_0 bytes
+            nullptr,                      // scales embedded
+            kai_kernel_idx, true);
+        } else {
+          // Fallback to separate buffer if dimensions are weirdly padded
+          kai_packed_weights_.resize(packed_size);
+          nntr_qsi8d32p_qsi4c32p_rhs_pack(
+            N, K,
+            kai_packed_weights_.data(),
+            unpacked.data(),
+            nullptr,
+            kai_kernel_idx, true);
+        }
+        kai_packed_ready_ = true;
+      }
+
+      auto M = hidden_step.height();
+      void* packed_buffer = kai_packed_weights_.empty() ? 
+                            (void *)weight.getData() : 
+                            (void *)kai_packed_weights_.data();
+
+      nntr_gemm_qsi8d32p_qsi4c32p_packed(
+        M, N, K,
+        (void *)input_step.getData(),
+        packed_buffer,
+        hidden_step.getData<float>(),
+        kai_kernel_idx, true);
+    } else if (weight.getDataType() == ml::train::TensorDim::DataType::QINT4) {
+      // Offline-packed QINT4 natively for KleidiAI
+      const uint32_t K = weight.height();
+      const uint32_t N = weight.width();
+      const uint32_t kai_kernel_idx = 0; // neon_dotprod 1x4
+      auto M = hidden_step.height();
+
+      nntr_gemm_qsi8d32p_qsi4c32p_packed(
+        M, N, K,
+        (void *)input_step.getData(),
+        (void *)weight.getData(),
+        hidden_step.getData<float>(),
+        kai_kernel_idx, true);
+    } else
+#endif
+    {
+      input_step.dot(weight, hidden_step, false, false);
+    }
 
     if (has_lora) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
