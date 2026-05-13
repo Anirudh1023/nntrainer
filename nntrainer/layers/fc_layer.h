@@ -122,6 +122,8 @@ private:
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
+  std::vector<uint8_t> kai_packed_weights_; /**< persistent KAI packed buffer */
+  bool kai_packed_ready_ = false;
 };
 } // namespace nntrainer
 
