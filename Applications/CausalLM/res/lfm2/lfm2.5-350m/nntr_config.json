@@ -1,0 +1,19 @@
+{
+    "model_type": "CausalLM",
+    "model_tensor_type": "FP32-FP32",
+    "model_file_name": "nntr_lfm2_fp32.bin",
+    "fc_layer_dtype": "FP32",
+    "embedding_dtype": "FP32",
+    "lora_rank": 0,
+    "lora_alpha": 0,
+    "lora_target": [],
+    "bad_word_ids": [],
+    "fsu": false,
+    "fsu_lookahead": 2,
+    "num_to_generate": 128,
+    "init_seq_len": 128,
+    "max_seq_len": 2048,
+    "batch_size": 1,
+    "tokenizer_file": "/app/Applications/CausalLM/res/lfm2/lfm2.5-350m/tokenizer.json",
+    "sample_input": "<|startoftext|><|im_start|>user\nGive me a short introduction to large language models.<|im_end|>\n<|im_start|>assistant\n"
+}
