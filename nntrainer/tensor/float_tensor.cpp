@@ -802,8 +802,7 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     } else {
       /// @todo This should be replaced with standard CPU INT4 computation
       for (unsigned int i = 0; i < input.size(); ++i) {
-        gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
-                  rdatas[i], Ns[i]);
+        dotQInteger(*input[i], *output[i], trans, trans_in, beta, Tdatatype::QINT4);
       }
     }
   }
@@ -814,13 +813,9 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       gemm_q4_0(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i], Ns[i]);
     }
   } else { // QINT4
-    /// @note It is essential to understand that this section of the code
-    /// requires the `input` data to be converted to Q4_0 type, not QINT4 type.
-    /// This should be replaced with standard CPU INT4 computation instead of
-    /// using Q4_0.
+    /// Use proper KAI kernels for QINT4 on CPU like Q4_0 uses GGML kernels
     for (unsigned int i = 0; i < input.size(); ++i) {
-      gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
-                rdatas[i], Ns[i]);
+      dotQInteger(*input[i], *output[i], trans, trans_in, beta, Tdatatype::QINT4);
     }
   }
 #endif
@@ -1009,38 +1004,29 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
-#ifndef ENABLE_OPENCL
+  // Use KAI kernels when available, otherwise throw error
+  if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) { 
 #ifdef ENABLE_FP16
-  if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-    uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
+    // idx_variant MUST match the k_idx used during rhs_pack in save path
+    // (layer_devel.h uses k_idx=3 for nntr_qsi4cxp_qs4cxs1s0_rhs_pack)
+    uint32_t opt_kernel_idx = 3;
     nntr_gemm_qai8dxp_qsi4cxp_packed(
-      M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
-      true); /// @todo kernel supports both trans / noTrans situation
-  } else {
+      M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx, true); /// @todo kernel supports both trans / noTrans situation
+#else
+    // QINT4 requires KAI kernels to be available
     throw std::runtime_error(
-      "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-  }
-#else
-  /// @note It is essential to understand that this section of the code requires
-  /// the `input` data to be converted to Q4_0 type, not QINT4 type. This should
-  /// be replaced with standard CPU INT4 computation instead of using Q4_0.
-  gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+      "Error: QINT4 Dot requires KAI kernels (ENABLE_FP16) to be enabled");
 #endif
-#else
-  if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
-      getMemoryData()->isSVM()) {
-    if (M == 1) {
-      gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
-                   Int4QTensor::getGroupSize());
-    } else {
-      sgemm_int4_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
-                    Int4QTensor::getGroupSize());
-    }
   } else {
-    /// @todo This should be replaced with standard CPU INT4 computation
-    gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+    uint16_t raw_qs = static_cast<uint16_t>(input.q_scheme());
+    char hex_buf[16];
+    snprintf(hex_buf, sizeof(hex_buf), "0x%04x", raw_qs);
+    throw std::runtime_error(
+      std::string("Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme, ") +
+      "got q_scheme=" + std::string(hex_buf) +
+      " (dec=" + std::to_string(static_cast<int>(raw_qs)) +
+      ") valid: 0x0000=PER_TENSOR, 0x0001=PER_CHANNEL");
   }
-#endif
 
   return output;
 }

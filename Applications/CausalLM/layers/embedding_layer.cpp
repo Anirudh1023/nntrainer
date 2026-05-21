@@ -225,6 +225,10 @@ void EmbeddingLayer::save(std::ofstream &file,
                                    quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(file);
+        } else if (dtype == nntrainer::TensorDim::DataType::QINT4) {
+          // QINT4 tensors are already quantized with proper dimensions
+          // Save directly like pre-quantized tensors
+          weight.save(file);
         } else {
           NNTR_THROW_IF(true, std::runtime_error)
             << "This dtype is not supported in save with quantization";

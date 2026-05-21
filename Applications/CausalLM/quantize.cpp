@@ -36,7 +36,7 @@
  *     --lmhead_dtype <type> Target dtype for LM head layer (default: FP32)
  *     --output_bin <name> Output bin filename (auto-generated if omitted)
  *
- *   Supported data types: FP32, FP16, Q4_0, Q6_K
+ *   Supported data types: FP32, FP16, Q4_0, Q6_K, QINT4
  *
  *   Example:
  *     # Quantize Qwen3-4B to Q4_0 FC layers (embedding stays FP32):
@@ -89,7 +89,8 @@ namespace {
  */
 const std::map<std::string, DataType> dtype_str_map = {
   {"FP32", DataType::FP32}, {"FP16", DataType::FP16}, {"Q4_0", DataType::Q4_0},
-  {"Q6_K", DataType::Q6_K}, {"Q4_K", DataType::Q4_K}, {"NONE", DataType::NONE},
+  {"Q6_K", DataType::Q6_K}, {"Q4_K", DataType::Q4_K}, {"QINT4", DataType::QINT4},
+  {"NONE", DataType::NONE},
 };
 
 /**
@@ -102,7 +103,7 @@ DataType strToDataType(const std::string &s) {
   auto it = dtype_str_map.find(upper);
   if (it == dtype_str_map.end()) {
     throw std::invalid_argument("Unsupported data type: " + s +
-                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K");
+                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K, QINT4");
   }
   return it->second;
 }
@@ -295,7 +296,7 @@ void printUsage(const char *prog) {
     << "                        from this config will be used.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
-    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
+    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K, QINT4\n"
     << "\n"
     << "Examples:\n"
     << "  # Quantize FC layers to Q4_0 (default):\n"

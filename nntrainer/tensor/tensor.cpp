@@ -198,6 +198,10 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, alloc_now, init, name, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
+    // QINT4 with KAI kernels uses PER_CHANNEL_AFFINE by default
+    if (qscheme == QScheme::PER_TENSOR_AFFINE) {
+      qscheme = QScheme::PER_CHANNEL_AFFINE;
+    }
     itensor_ = std::make_unique<Int4QTensor>(d, alloc_now, init, name, qscheme);
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
@@ -247,7 +251,11 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, buf);
+    // QINT4 with KAI kernels uses PER_CHANNEL_AFFINE by default
+    if (qscheme == QScheme::PER_TENSOR_AFFINE) {
+      qscheme = QScheme::PER_CHANNEL_AFFINE;
+    }
+    itensor_ = std::make_unique<Int4QTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, buf);

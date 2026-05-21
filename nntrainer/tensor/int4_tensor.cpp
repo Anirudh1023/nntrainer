@@ -139,10 +139,27 @@ void Int4QTensor::allocate() {
     /// allocate new memory for the tensor data
     MemoryData *mem_data;
 
-    /// quantized 4-bit is stored as a 8-bit signed integer (int4x2)
-    mem_data =
-      new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
-                                         sizeof(float) * scale_size()]{}));
+    if (qscheme == QScheme::PER_CHANNEL_AFFINE) {
+#ifdef ENABLE_FP16
+      // For PER_CHANNEL_AFFINE, allocate KAI packed format size
+      // KAI expects (N, K) where N=output=width, K=input=height
+      unsigned int N = width();
+      unsigned int K = height();
+      uint8_t k_idx = 3;
+      size_t packed_size =
+        nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(N, K, k_idx, true);
+      mem_data = new MemoryData((void *)(new int8_t[packed_size]{}));
+#else
+      mem_data =
+        new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
+                                           sizeof(float) * scale_size()]{}));
+#endif
+    } else {
+      /// quantized 4-bit is stored as a 8-bit signed integer (int4x2)
+      mem_data =
+        new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
+                                           sizeof(float) * scale_size()]{}));
+    }
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<int8_t>();
       delete mem_data;
@@ -359,6 +376,7 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+
   read_quantization_info(file, start_offset, read_from_offset);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
@@ -382,6 +400,7 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+
   read_quantization_info(src, start_offset, read_from_offset);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
@@ -554,6 +573,20 @@ void Int4QTensor::print(std::ostream &out) const {
 }
 
 size_t Int4QTensor::getMemoryBytes() const {
+  if (qscheme == QScheme::PER_CHANNEL_AFFINE) {
+#ifdef ENABLE_FP16
+    // For PER_CHANNEL_AFFINE, data is stored in KAI packed format
+    // which is what nntr_gemm_qai8dxp_qsi4cxp_packed expects
+    // KAI expects (N, K) where N=output=width, K=input=height
+    unsigned int N = width();
+    unsigned int K = height();
+    uint8_t k_idx = 3;
+    return nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(N, K, k_idx, true);
+#else
+    return ((size() + 1) / 2) * dim.getDataTypeSize() +
+           scale_size() * sizeof(uint16_t);
+#endif
+  }
   return ((size() + 1) / 2) * dim.getDataTypeSize() +
          scale_size() * sizeof(uint16_t);
 }
@@ -601,6 +634,25 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
   group_size = 32; /// Remove me
+
+  // Debug: validate qscheme after reading
+  if (qscheme != QScheme::PER_TENSOR_AFFINE &&
+      qscheme != QScheme::PER_CHANNEL_AFFINE &&
+      qscheme != QScheme::BINARY_CODE_BASED &&
+      qscheme != QScheme::Q4_Kx8 &&
+      qscheme != QScheme::Q6_K &&
+      qscheme != QScheme::Q4_0) {
+    uint8_t *raw = (uint8_t *)&qscheme;
+    char hex_buf[32];
+    snprintf(hex_buf, sizeof(hex_buf), "0x%02x%02x", raw[0], raw[1]);
+    throw std::runtime_error(
+      std::string("[Int4QTensor::read_quantization_info] Invalid qscheme! ") +
+      "raw hex: " + std::string(hex_buf) +
+      " dec=" + std::to_string(static_cast<int>(qscheme)) +
+      " dim=" + std::to_string(dim.height()) + "x" + std::to_string(dim.width()) +
+      " offset=" + std::to_string(start_offset) +
+      " from_offset=" + std::to_string(read_from_offset));
+  }
 }
 
 void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
@@ -609,6 +661,25 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
   group_size = 32; /// Remove me
+
+  // Debug: validate qscheme after reading
+  if (qscheme != QScheme::PER_TENSOR_AFFINE &&
+      qscheme != QScheme::PER_CHANNEL_AFFINE &&
+      qscheme != QScheme::BINARY_CODE_BASED &&
+      qscheme != QScheme::Q4_Kx8 &&
+      qscheme != QScheme::Q6_K &&
+      qscheme != QScheme::Q4_0) {
+    uint8_t *raw = (uint8_t *)&qscheme;
+    char hex_buf[32];
+    snprintf(hex_buf, sizeof(hex_buf), "0x%02x%02x", raw[0], raw[1]);
+    throw std::runtime_error(
+      std::string("[Int4QTensor::read_quantization_info(ReadSource)] Invalid qscheme! ") +
+      "raw hex: " + std::string(hex_buf) +
+      " dec=" + std::to_string(static_cast<int>(qscheme)) +
+      " dim=" + std::to_string(dim.height()) + "x" + std::to_string(dim.width()) +
+      " offset=" + std::to_string(start_offset) +
+      " from_offset=" + std::to_string(read_from_offset));
+  }
 }
 
 size_t Int4QTensor::getGroupSize() { return group_size; }

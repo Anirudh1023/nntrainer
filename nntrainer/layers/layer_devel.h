@@ -31,6 +31,7 @@
 #include <common.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
+#include <cpu_backend.h>
 
 namespace ml::train {
 class Layer;
@@ -408,6 +409,63 @@ public:
                             quant_weight.size(), N, K);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::QINT4) {
+#ifdef ENABLE_FP16
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              // Skip quantization for bias-like tensors (1D with height == 1)
+              // as they are not suitable for QINT4 block quantization
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "QINT4 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                // Transpose weight: [K, N] → [N, K]
+                // KAI functions expect N×K layout (N=output, K=input)
+                Tensor weight_t = weight.transpose("0:2:1");
+
+                // Quantize FP32 to QINT4 (qs4cx format) using KAI
+                std::vector<uint8_t> kai_quant_data(N * K / 2);
+                std::vector<float> kai_quant_scale(N);
+
+                nntr_quant_qs4cx_f32(N, K, (void *)weight_t.getData<float>(),
+                                     (void *)kai_quant_data.data(),
+                                     (void *)kai_quant_scale.data());
+
+                // Pack quantized weights for KAI GEMM kernel
+                uint8_t k_idx = 3;
+                size_t packed_size =
+                  nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(N, K, k_idx, true);
+
+                std::vector<uint8_t> packed_weights(packed_size);
+
+                nntr_qsi4cxp_qs4cxs1s0_rhs_pack(
+                  N, K, packed_weights.data(), kai_quant_data.data(),
+                  kai_quant_scale.data(), k_idx, true);
+
+                // Write qscheme header + KAI packed data directly to file
+                // This matches what Int4QTensor::read() expects:
+                //   read_quantization_info() reads 2-byte qscheme header
+                //   then read() reads getMemoryBytes() of packed data
+                uint16_t qscheme_val =
+                  static_cast<uint16_t>(QScheme::PER_CHANNEL_AFFINE);
+                file.write(reinterpret_cast<const char *>(&qscheme_val),
+                           sizeof(uint16_t));
+                file.write(reinterpret_cast<const char *>(packed_weights.data()),
+                           packed_size);
+              }
+#else
+              NNTR_THROW_IF(true, std::runtime_error)
+                << "QINT4 quantization requires KAI kernels (ENABLE_FP16) to be enabled";
+#endif
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";

@@ -173,6 +173,9 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   ///@todo this quantizaer should be moved to tensor, not layer!
   switch (context.getWeightDataType()) {
   case ml::train::TensorDim::DataType::QINT4:
+    quantizer =
+      Quantization::createQuantizer(nntrainer::QScheme::PER_CHANNEL_AFFINE);
+    break;
   case ml::train::TensorDim::DataType::QINT8:
   case ml::train::TensorDim::DataType::QINT16:
     quantizer =
@@ -210,7 +213,10 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   ///@todo This dequantization action should be moved to tensor.dot()
-  if (quantizer != nullptr) {
+  /// Bypass quantizer for Q4_0 and QINT4 to use optimized kernels directly
+  if (quantizer != nullptr && 
+      weight.getDataType() != ml::train::TensorDim::DataType::Q4_0 &&
+      weight.getDataType() != ml::train::TensorDim::DataType::QINT4) {
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
     input_.dot(weight_, hidden_, false, false);
   } else {
