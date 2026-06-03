@@ -173,6 +173,9 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   ///@todo this quantizaer should be moved to tensor, not layer!
   switch (context.getWeightDataType()) {
   case ml::train::TensorDim::DataType::QINT4:
+    quantizer =
+      Quantization::createQuantizer(nntrainer::QScheme::PER_CHANNEL_AFFINE);
+    break;
   case ml::train::TensorDim::DataType::QINT8:
   case ml::train::TensorDim::DataType::QINT16:
     quantizer =
@@ -210,7 +213,7 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   ///@todo This dequantization action should be moved to tensor.dot()
-  if (quantizer != nullptr) {
+  if (quantizer != nullptr && weight.getDataType() != ml::train::TensorDim::DataType::QINT4) {
     Tensor weight_ = quantizer->dequantize(weight, input_.getDataType());
     input_.dot(weight_, hidden_, false, false);
   } else {
@@ -272,7 +275,12 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
-    input_step.dot(weight, hidden_step, false, false);
+    if (quantizer != nullptr && weight.getDataType() != ml::train::TensorDim::DataType::QINT4) {
+      Tensor weight_ = quantizer->dequantize(weight, input_step.getDataType());
+      input_step.dot(weight_, hidden_step, false, false);
+    } else {
+      input_step.dot(weight, hidden_step, false, false);
+    }
 
     if (!std::get<props::LoraRank>(fc_props).empty()) {
       nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();

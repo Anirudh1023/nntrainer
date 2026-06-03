@@ -301,9 +301,14 @@ public:
   QScheme q_scheme() const override;
 
   /**
-   * @brief Returns quantization group size
+   * @brief Get the fixed KleidiAI kernel index based on compile-time environment detection.
    */
-  static size_t getGroupSize();
+  static int32_t get_kleidiai_kernel_idx();
+
+  /**
+   * @brief Returns quantization group size (stub for OpenCL)
+   */
+  static size_t getGroupSize() { return 32; }
 
 private:
   /**
@@ -316,7 +321,7 @@ private:
    *
    * @note need to properly define this
    */
-  static size_t group_size;
+  size_t group_size;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is

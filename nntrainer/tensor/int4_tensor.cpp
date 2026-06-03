@@ -17,7 +17,18 @@
 
 namespace nntrainer {
 
-size_t Int4QTensor::group_size = 32;
+int32_t Int4QTensor::get_kleidiai_kernel_idx(){
+#if defined(ENABLE_SME)
+  // SME kernel variant index
+  return 8;
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+  // NEON kernel variant index
+  return 3;
+#else
+  // Fallback - no ARM extension available
+  return -1;
+#endif
+}
 
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
@@ -341,7 +352,8 @@ void Int4QTensor::copy_with_stride(const Tensor &input, Tensor &output) {
 
 void Int4QTensor::save(std::ostream &file) {
   /// @note Save quantization information
-  save_quantization_info(file);
+  if (get_kleidiai_kernel_idx() < 0)
+    save_quantization_info(file);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -359,7 +371,9 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
-  read_quantization_info(file, start_offset, read_from_offset);
+  
+  if (get_kleidiai_kernel_idx() < 0)
+    read_quantization_info(file, start_offset, read_from_offset);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -367,8 +381,10 @@ void Int4QTensor::read(std::ifstream &file, size_t start_offset,
     << "read size: " << getMemoryBytes()
     << " is too big. It cannot be represented by std::streamsize";
 
-  if (read_from_offset) {
-    start_offset += sizeof(uint16_t);
+  if (get_kleidiai_kernel_idx() < 0) {
+    if (read_from_offset) {
+      start_offset += sizeof(uint16_t);
+    }
   }
 
   checkedRead(file, (char *)getData(), sz,
@@ -382,7 +398,8 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
-  read_quantization_info(src, start_offset, read_from_offset);
+  if (get_kleidiai_kernel_idx() < 0)
+    read_quantization_info(src, start_offset, read_from_offset);
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -390,8 +407,10 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
     << "read size: " << getMemoryBytes()
     << " is too big. It cannot be represented by std::streamsize";
 
-  if (read_from_offset) {
-    start_offset += sizeof(uint16_t);
+  if (get_kleidiai_kernel_idx() < 0) {
+    if (read_from_offset) {
+      start_offset += sizeof(uint16_t);
+    }
   }
 
   checkedRead(src, (char *)getData(), sz,
@@ -554,8 +573,13 @@ void Int4QTensor::print(std::ostream &out) const {
 }
 
 size_t Int4QTensor::getMemoryBytes() const {
-  return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(uint16_t);
+  int32_t idx = get_kleidiai_kernel_idx();
+  if (idx >= 0){
+      return nntrainer::nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(width(), height(), idx, true);
+  } else {
+      return ((size() + 1) / 2) * dim.getDataTypeSize() +
+             scale_size() * sizeof(float);
+  }
 }
 
 size_t Int4QTensor::scale_size() const {
@@ -564,6 +588,8 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
+    if (group_size == 0 || group_size == height())
+      return width();
     return height() * width() / group_size;
     break;
   default:

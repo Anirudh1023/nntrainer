@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu99',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -99,7 +99,6 @@ warning_c_flags = [
   '-Wnested-externs',
   '-Waggregate-return',
   '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
   '-Wno-error=varargs'
 ]
 
@@ -159,6 +158,16 @@ if get_option('enable-fp16')
      add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
+     arm_arch_opt = get_option('arm-arch')
+     if arm_arch_opt == 'armv9.2-a'
+       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
+       if get_option('enable-sve2')
+         extra_defines += '-DENABLE_SVE2=1'
+       endif
+       if get_option('enable-sme')
+         extra_defines += '-DENABLE_SME=1'
+       endif
+     endif
    elif arch == 'aarch64'
      ## About FP16 in GCC (from GCC-9.1 manual)
      # https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html
@@ -179,7 +188,12 @@ if get_option('enable-fp16')
      if arm_arch_opt == 'armv9.2-a'
        add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV9_2A=1'
-       extra_defines += '-DENABLE_SVE2=1'
+       if get_option('enable-sve2')
+         extra_defines += '-DENABLE_SVE2=1'
+       endif
+       if get_option('enable-sme')
+         extra_defines += '-DENABLE_SME=1'
+       endif
      elif arm_arch_opt == 'armv8.2-a'
        add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'

@@ -42,6 +42,7 @@
 #include <model_loader.h>
 #include <multiout_realizer.h>
 #include <neuralnet.h>
+#include <int4_tensor.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -720,7 +721,9 @@ void NeuralNetwork::load(const std::string &file_path,
       /// quantized tensors, requiring qparam to be saved
       /// and creating a common interface to check if qparam is needed
       /// this kind of type checking should be avoided
-      if (tensor_data_type != TensorDim::DataType::FP32 &&
+      if (tensor_data_type == TensorDim::DataType::QINT4 && nntrainer::Int4QTensor::get_kleidiai_kernel_idx() >= 0) {
+        // for QINT4 with KleidiAI packing, qparam (scale) is interleaved and type header is not saved
+      } else if (tensor_data_type != TensorDim::DataType::FP32 &&
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
           tensor_data_type != TensorDim::DataType::Q4_0) {

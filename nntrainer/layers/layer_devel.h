@@ -29,6 +29,7 @@
 
 #include <base_properties.h>
 #include <common.h>
+#include <cpu_backend.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -408,6 +409,59 @@ public:
                             quant_weight.size(), N, K);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::QINT4) {
+#ifdef ENABLE_FP16
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with QINT4 quantization only supports FP32 weight.";
+
+              TensorDim dim = weight.getDim();
+              uint32_t K = dim.height();
+              uint32_t N = dim.width();
+
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "QINT4 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                nntrainer::TensorDim dim_qint4(1, 1, K, N, TensorDim::Format::NCHW, nntrainer::Tdatatype::QINT4);
+                nntrainer::Tensor W_qint4(dim_qint4);
+
+                int32_t kernel_idx = nntrainer::Int4QTensor::get_kleidiai_kernel_idx();
+                NNTR_THROW_IF(kernel_idx < 0, std::runtime_error)
+                  << "QINT4 save on CPU requires ARM NEON or SME.";
+
+                uint32_t k_idx = static_cast<uint32_t>(kernel_idx);
+                std::vector<float> kai_quant_scale(N);
+                std::vector<uint8_t> kai_quant_data(N * K / 2);
+                size_t packed_size = nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+                    N, K, k_idx, true);
+
+                std::vector<uint8_t> packed_weights(packed_size);
+                
+                nntr_quant_qs4cx_f32(N, K, (void *)weight.getData<float>(), 
+                                                (void *)kai_quant_data.data(), 
+                                                (void *)kai_quant_scale.data());
+
+                nntr_qsi4cxp_qs4cxs1s0_rhs_pack(N, K,
+                                                packed_weights.data(),
+                                                kai_quant_data.data(),
+                                                kai_quant_scale.data(),
+                                                k_idx, true);
+
+                NNTR_THROW_IF(packed_size > W_qint4.getMemoryBytes(), std::runtime_error)
+                  << "packed_size exceeds tensor memory allocation";
+
+                memcpy(W_qint4.getData<uint8_t>(), packed_weights.data(), packed_size);
+                W_qint4.save(file);
+              }
+#else
+              NNTR_THROW_IF(true, std::runtime_error)
+                << "QINT4 quantization requires ENABLE_FP16 to be defined.";
+#endif
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
