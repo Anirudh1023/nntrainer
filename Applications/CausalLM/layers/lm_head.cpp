@@ -112,8 +112,9 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
-  throw nntrainer::exception::not_supported(
-    "Forwarding for LMHead layer is not supported");
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  unsigned int height = input_.getDim().height();
+  incremental_forwarding(context, 0, height, training);
 }
 
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
@@ -158,13 +159,41 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 }
 
 void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for LMHead layer is not supported");
+  nntrainer::Tensor weight =
+    context.getWeight(weight_idx[LmHeadParams::weight]);
+  nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+
+  // dx is (B,1,seq_len,H); dy is (B,1,1,V).
+  // forwarding() used only the last row of input, so gradient goes only there.
+  dx.setZero();
+
+  ml::train::TensorDim dx_dim = dx.getDim();
+  ml::train::TensorDim dy_dim = dy.getDim();
+
+  ml::train::TensorDim dx_step_dim = dx_dim;
+  dx_step_dim.batch(1);
+  dx_step_dim.height(1);
+
+  ml::train::TensorDim dy_step_dim = dy_dim;
+  dy_step_dim.batch(1);
+
+  unsigned int last_row = dx_dim.height() - 1;
+
+  for (unsigned int b = 0; b < dx_dim.batch(); ++b) {
+    nntrainer::Tensor dx_last = dx.getSharedDataTensor(
+      dx_step_dim,
+      b * dx_dim.getFeatureLen() + last_row * dx.width(), true);
+    nntrainer::Tensor dy_step = dy.getSharedDataTensor(
+      dy_step_dim, b * dy_dim.getFeatureLen(), true);
+    dy_step.dot(weight, dx_last, false, true);
+  }
 }
 
 void LmHeadLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcGradient for LMHead layer is not supported");
+  // LM head is frozen in LoRA mode — this should not be called,
+  // but provide a valid no-op so compilation/linking succeeds.
+  (void)context;
 }
 
 void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,

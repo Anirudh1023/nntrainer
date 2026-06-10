@@ -48,14 +48,19 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", Q), withKey("unit", head_dim * n_heads),
     withKey("disable_bias", "true"), withKey("input_layers", query_name),
     withKey("weight_initializer", "ones")};
+  if (hasLoRA("wq"))
+    appendLoRAProps(q_params);
+  else if (LORA_RANK > 0)
+    q_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", q_params));
 
-  // Q-reshaped-norm layer
-  // q_norm(q_proj.view(hidden_shape))
+  // Q-reshaped-norm layer (frozen — no trainable params in LoRA mode)
   std::vector<std::string> q_norm_params = {
     withKey("name", Q_norm), withKey("input_layers", Q),
     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("feature_size", std::to_string(head_dim))};
+  if (LORA_RANK > 0)
+    q_norm_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("reshaped_rms_norm", q_norm_params));
 
   // K layer
@@ -63,14 +68,19 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
     withKey("disable_bias", "true"), withKey("input_layers", key_name),
     withKey("weight_initializer", "ones")};
+  if (hasLoRA("wk"))
+    appendLoRAProps(k_params);
+  else if (LORA_RANK > 0)
+    k_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", k_params));
 
-  // K-reshaped-norm layer
-  // k_norm(k_proj.view(hidden_shape))
+  // K-reshaped-norm layer (frozen — no trainable params in LoRA mode)
   std::vector<std::string> k_norm_params = {
     withKey("name", K_norm), withKey("input_layers", K),
     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("feature_size", std::to_string(head_dim))};
+  if (LORA_RANK > 0)
+    k_norm_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("reshaped_rms_norm", k_norm_params));
 
   // V layer
@@ -78,9 +88,13 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
     withKey("disable_bias", "true"), withKey("input_layers", value_name),
     withKey("weight_initializer", "ones")};
+  if (hasLoRA("wv"))
+    appendLoRAProps(v_params);
+  else if (LORA_RANK > 0)
+    v_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", v_params));
 
-  // Attention core layer
+  // Attention core layer (always frozen — no LoRA on attention weights themselves)
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -91,12 +105,18 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("input_layers", {Q_norm, K_norm, V})};
+  if (LORA_RANK > 0)
+    a_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("mha_core", a_params));
 
   // O layer
   std::vector<std::string> o_params = {
     withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
     withKey("input_layers", A), withKey("weight_initializer", "ones")};
+  if (hasLoRA("wo"))
+    appendLoRAProps(o_params);
+  else if (LORA_RANK > 0)
+    o_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", o_params));
 
   return layers;

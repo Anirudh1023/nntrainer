@@ -110,14 +110,16 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
 
+  // Base weight is trainable only when LoRA is not active for this layer.
+  // When lora_rank > 0, only loraA/loraB update; W is frozen.
   weight_idx[FCParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "weight", true);
+    weight_regularizer_constant, weight_decay, "weight", (lora_rank == 0));
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[FCParams::bias] =
       context.requestWeight(bias_dim, bias_initializer, WeightRegularizer::NONE,
-                            1.0f, bias_decay, "bias", true);
+                            1.0f, bias_decay, "bias", (lora_rank == 0));
   }
 
   /** create weights for LoRA */

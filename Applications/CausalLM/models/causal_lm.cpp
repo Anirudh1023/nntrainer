@@ -121,6 +121,9 @@ void CausalLM::constructModel() {
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
 
+  if (LORA_RANK > 0)
+    lmhead_prop.emplace_back(withKey("trainable", "false"));
+
   model->addLayer(createLayer(lmhead_type, lmhead_prop));
 }
 

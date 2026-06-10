@@ -14,6 +14,8 @@
 #ifndef __SWIGLU_LAYER_H__
 #define __SWIGLU_LAYER_H__
 
+#include <array>
+
 #include <layer_context.h>
 #include <layer_devel.h>
 #include <node_exporter.h>
@@ -33,12 +35,17 @@ namespace causallm {
  *
  */
 WIN_EXPORT class SwiGLULayer final : public nntrainer::Layer {
+private:
+  std::array<unsigned int, 1> tensor_idx;
+
 public:
   /**
    * @brief Construct a new custom SwiGLU layer object
    *
    */
-  WIN_EXPORT SwiGLULayer() : Layer() {}
+  WIN_EXPORT SwiGLULayer() : Layer() {
+    tensor_idx.fill(std::numeric_limits<unsigned>::max());
+  }
 
   /**
    * @brief Destroy the custom SwiGLU layer object
@@ -80,7 +87,7 @@ public:
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
+           const ml::train::ExportMethods &method) const override {};
 
   /**
    * @copydoc Layer::getType()
@@ -92,14 +99,17 @@ public:
   /**
    * @copydoc Layer::setProperty(const std::vector<std::string> &values)
    */
-  WIN_EXPORT void
-  setProperty(const std::vector<std::string> &values) override{};
+  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override {
+  };
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   inline static const std::string type = "swiglu";
+
+private:
+  enum SwiGLUParams { sigmoid_gate = 0 };
 };
 
 } // namespace causallm

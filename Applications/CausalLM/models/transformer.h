@@ -82,9 +82,17 @@ public:
   virtual ~Transformer() {}
 
   /**
-   * @brief Initialize and Construct the Transformer model
+   * @brief Initialize and Construct the Transformer model (inference mode)
    */
   virtual void initialize();
+
+  /**
+   * @brief Initialize model for LoRA fine-tuning (training mode).
+   *        Adds cross_softmax loss, Adam optimizer, compiles in TRAIN mode.
+   * @param lr   Learning rate for Adam optimizer
+   * @param epochs Number of training epochs
+   */
+  virtual void initializeForTraining(float lr, unsigned int epochs);
 
   /**
    * @brief Load the model weights from a file
@@ -95,6 +103,40 @@ public:
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
+
+  /**
+   * @brief Save only LoRA adapter weights (loraA/loraB) to a file.
+   *        For use after LoRA training.
+   */
+  virtual void save_weight_lora(const std::string &weight_path);
+
+  /**
+   * @brief Load base weights, then overlay LoRA adapter weights on top.
+   */
+  virtual void load_weight_lora(const std::string &base_path,
+                                const std::string &lora_path);
+
+  /**
+   * @brief Set a dataset on the underlying nntrainer model.
+   */
+  virtual void
+  setDataset(const ml::train::DatasetModeType &mode,
+             std::shared_ptr<ml::train::Dataset> dataset);
+
+  /**
+   * @brief Run training on the model (wraps model->train()).
+   */
+  virtual void train();
+
+  /**
+   * @brief Print model summary to a stream.
+   */
+  virtual void summarize(std::ostream &out, unsigned int type);
+
+  /**
+   * @brief Export weight names and norms to a text file for debugging.
+   */
+  virtual void exportWeightsToFile(const std::string &path);
 
   /**
    * @brief Save the weight to a file with type conversion
@@ -160,6 +202,17 @@ protected:
   virtual void registerCustomLayers();
 
   /**
+   * @brief Returns true if module_type (e.g. "q_proj") is in LORA_TARGET and
+   * LORA_RANK > 0.
+   */
+  bool hasLoRA(const std::string &module_type) const;
+
+  /**
+   * @brief Append lora_rank (and lora_alpha if set) to a layer property list.
+   */
+  void appendLoRAProps(std::vector<std::string> &props) const;
+
+  /**
    * @brief register Outputs
    */
   bool is_initialized = false; /**< Flag to check if the model is initialized */
@@ -198,6 +251,11 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
 
+  unsigned int LORA_RANK = 0;  /**< LoRA rank (0 = disabled) */
+  unsigned int LORA_ALPHA = 0; /**< LoRA alpha (0 = use scaling=1) */
+  std::vector<std::string> LORA_TARGET; /**< module names to apply LoRA to,
+                                            e.g. {"q_proj","v_proj"} */
+
   // Performance metrics
   PerformanceMetrics performance_metrics;
 };
@@ -207,6 +265,8 @@ protected:
  * @return JSON object
  * @throws std::runtime_error on file open or parse failure
  */
+std::string LoadBytesFromFile(const std::string &path);
+
 inline json LoadJsonFile(const std::string &file_path) {
   std::ifstream file(file_path);
   if (!file.is_open()) {
