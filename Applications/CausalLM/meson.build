@@ -98,3 +98,16 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+
+lora_train_src = [
+    meson.current_source_dir() / 'lora_train.cpp',
+    meson.current_source_dir() / 'train_qwen3_lora_master.cpp',
+]
+
+e_lora_train = executable('nntr_lora_train',
+    lora_train_src,
+    include_directories: causallm_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+    link_args: [tokenizer_path],
+)
