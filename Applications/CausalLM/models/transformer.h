@@ -105,6 +105,14 @@ public:
   virtual void save_weight(const std::string &weight_path);
 
   /**
+   * @brief Save the weight with an explicit ModelFormat.
+   *        MODEL_FORMAT_LORA_BIN delegates to save_weight_lora(); otherwise
+   *        behaves like save_weight(path).
+   */
+  virtual void save_weight(const std::string &weight_path,
+                           ml::train::ModelFormat format);
+
+  /**
    * @brief Save only LoRA adapter weights (loraA/loraB) to a file.
    *        For use after LoRA training.
    */

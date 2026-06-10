@@ -402,6 +402,15 @@ void Transformer::save_weight(const std::string &weight_path) {
   }
 };
 
+void Transformer::save_weight(const std::string &weight_path,
+                              ml::train::ModelFormat format) {
+  if (format == ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
+    save_weight_lora(weight_path);
+  } else {
+    save_weight(weight_path);
+  }
+};
+
 void Transformer::save_weight(
   const std::string &weight_path, ml::train::TensorDim::DataType dtype,
   const std::map<std::string, ml::train::TensorDim::DataType>
