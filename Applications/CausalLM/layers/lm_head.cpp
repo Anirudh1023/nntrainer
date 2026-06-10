@@ -11,9 +11,9 @@
  *
  */
 
-#include "lm_head.h"
 #include <cpu_backend.h>
 #include <layer_context.h>
+#include <lm_head.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -40,7 +40,7 @@ void LmHeadLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
     std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::Initializer::ONES;
+  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
   auto &bias_decay = std::get<nntrainer::props::BiasDecay>(*layer_impl_props);
@@ -112,13 +112,8 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
-
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   unsigned int height = input_.getDim().height();
-
-  // Process the full sequence by calling incremental_forwarding once with
-  // from=0 and to=height. This unifies the implementation and ensures
-  // training/inference consistency.
   incremental_forwarding(context, 0, height, training);
 }
 
@@ -143,80 +138,62 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   hidden_step_dim.batch(1);
 
   unsigned int b_size = input_dim.batch();
-  unsigned int step_height = to - from;
 
   for (unsigned int b = 0; b < b_size; ++b) {
-    for (unsigned int h = 0; h < step_height; ++h) {
-      // Process each token in the range [from, to)
-      // For inference (single token), step_height=1, so h=0 and we process
-      // token 'from' For training/test (full sequence), we process all tokens
-      nntrainer::Tensor input_step = input_.getSharedDataTensor(
-        input_step_dim,
-        b * input_dim.getFeatureLen() + (from + h) * input_.width(), true);
-      nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
-        hidden_step_dim,
-        b * hidden_dim.getFeatureLen() + (from + h) * hidden_dim.width(), true);
+    nntrainer::Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim,
+      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
+    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
-      input_step.dot(weight, hidden_step, false, false);
+    input_step.dot(weight, hidden_step, false, false);
 
-      if (auto &disable_bias =
-            std::get<nntrainer::props::DisableBias>(*layer_impl_props);
-          disable_bias.empty() || disable_bias.get() == false) {
-        nntrainer::Tensor &bias =
-          context.getWeight(weight_idx[LmHeadParams::bias]);
-        hidden_step.add_i(bias);
-      }
+    if (auto &disable_bias =
+          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      nntrainer::Tensor &bias =
+        context.getWeight(weight_idx[LmHeadParams::bias]);
+      hidden_step.add_i(bias);
     }
   }
 }
 
 void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[LmHeadParams::weight]);
   nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
 
-  // dx = dy . weight^T
-  dy.dot(weight, dx, false, true);
+  // dx is (B,1,seq_len,H); dy is (B,1,1,V).
+  // forwarding() used only the last row of input, so gradient goes only there.
+  dx.setZero();
+
+  ml::train::TensorDim dx_dim = dx.getDim();
+  ml::train::TensorDim dy_dim = dy.getDim();
+
+  ml::train::TensorDim dx_step_dim = dx_dim;
+  dx_step_dim.batch(1);
+  dx_step_dim.height(1);
+
+  ml::train::TensorDim dy_step_dim = dy_dim;
+  dy_step_dim.batch(1);
+
+  unsigned int last_row = dx_dim.height() - 1;
+
+  for (unsigned int b = 0; b < dx_dim.batch(); ++b) {
+    nntrainer::Tensor dx_last = dx.getSharedDataTensor(
+      dx_step_dim,
+      b * dx_dim.getFeatureLen() + last_row * dx.width(), true);
+    nntrainer::Tensor dy_step = dy.getSharedDataTensor(
+      dy_step_dim, b * dy_dim.getFeatureLen(), true);
+    dy_step.dot(weight, dx_last, false, true);
+  }
 }
 
 void LmHeadLayer::calcGradient(nntrainer::RunLayerContext &context) {
-
-  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &dweight =
-    context.getWeightGrad(weight_idx[LmHeadParams::weight]);
-
-  // dweight = in^T . dy
-  in.dot(dy, dweight, true, false);
-
-  if (auto &disable_bias =
-        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
-      disable_bias.empty() || disable_bias.get() == false) {
-    nntrainer::Tensor &dbias =
-      context.getWeightGrad(weight_idx[LmHeadParams::bias]);
-    dbias.setZero();
-    float *db_data = dbias.getData<float>();
-    const float *dy_data = dy.getData<float>();
-
-    size_t batch = dy.batch();
-    size_t channel = dy.channel();
-    size_t height = dy.height();
-    size_t width = dy.width();
-
-    for (size_t b = 0; b < batch; ++b) {
-      for (size_t c = 0; c < channel; ++c) {
-        for (size_t h = 0; h < height; ++h) {
-          size_t offset =
-            b * channel * height * width + c * height * width + h * width;
-          for (size_t w = 0; w < width; ++w) {
-            db_data[w] += dy_data[offset + w];
-          }
-        }
-      }
-    }
-  }
+  // LM head is frozen in LoRA mode — this should not be called,
+  // but provide a valid no-op so compilation/linking succeeds.
+  (void)context;
 }
 
 void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,

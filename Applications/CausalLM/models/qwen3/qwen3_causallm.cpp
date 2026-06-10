@@ -48,21 +48,19 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", Q), withKey("unit", head_dim * n_heads),
     withKey("disable_bias", "true"), withKey("input_layers", query_name),
     withKey("weight_initializer", "ones")};
-  if (isLoRATarget("wq")) {
-    q_params.push_back(withKey("lora_rank", LORA_RANK));
-    q_params.push_back(withKey("lora_alpha", LORA_ALPHA));
-  }
+  if (hasLoRA("wq"))
+    appendLoRAProps(q_params);
+  else if (LORA_RANK > 0)
+    q_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", q_params));
 
-  // Q-reshaped-norm layer
-  // q_norm(q_proj.view(hidden_shape))
+  // Q-reshaped-norm layer (frozen — no trainable params in LoRA mode)
   std::vector<std::string> q_norm_params = {
     withKey("name", Q_norm), withKey("input_layers", Q),
     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("feature_size", std::to_string(head_dim))};
-  if (LORA_RANK > 0) {
+  if (LORA_RANK > 0)
     q_norm_params.push_back(withKey("trainable", "false"));
-  }
   layers.push_back(createLayer("reshaped_rms_norm", q_norm_params));
 
   // K layer
@@ -70,21 +68,19 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
     withKey("disable_bias", "true"), withKey("input_layers", key_name),
     withKey("weight_initializer", "ones")};
-  if (isLoRATarget("wk")) {
-    k_params.push_back(withKey("lora_rank", LORA_RANK));
-    k_params.push_back(withKey("lora_alpha", LORA_ALPHA));
-  }
+  if (hasLoRA("wk"))
+    appendLoRAProps(k_params);
+  else if (LORA_RANK > 0)
+    k_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", k_params));
 
-  // K-reshaped-norm layer
-  // k_norm(k_proj.view(hidden_shape))
+  // K-reshaped-norm layer (frozen — no trainable params in LoRA mode)
   std::vector<std::string> k_norm_params = {
     withKey("name", K_norm), withKey("input_layers", K),
     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("feature_size", std::to_string(head_dim))};
-  if (LORA_RANK > 0) {
+  if (LORA_RANK > 0)
     k_norm_params.push_back(withKey("trainable", "false"));
-  }
   layers.push_back(createLayer("reshaped_rms_norm", k_norm_params));
 
   // V layer
@@ -92,13 +88,13 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
     withKey("disable_bias", "true"), withKey("input_layers", value_name),
     withKey("weight_initializer", "ones")};
-  if (isLoRATarget("wv")) {
-    v_params.push_back(withKey("lora_rank", LORA_RANK));
-    v_params.push_back(withKey("lora_alpha", LORA_ALPHA));
-  }
+  if (hasLoRA("wv"))
+    appendLoRAProps(v_params);
+  else if (LORA_RANK > 0)
+    v_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", v_params));
 
-  // Attention core layer
+  // Attention core layer (always frozen — no LoRA on attention weights themselves)
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -109,19 +105,18 @@ std::vector<LayerHandle> Qwen3Transformer::createAttention(
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("input_layers", {Q_norm, K_norm, V})};
-  if (LORA_RANK > 0) {
+  if (LORA_RANK > 0)
     a_params.push_back(withKey("trainable", "false"));
-  }
   layers.push_back(createLayer("mha_core", a_params));
 
   // O layer
   std::vector<std::string> o_params = {
     withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
     withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  if (isLoRATarget("wo")) {
-    o_params.push_back(withKey("lora_rank", LORA_RANK));
-    o_params.push_back(withKey("lora_alpha", LORA_ALPHA));
-  }
+  if (hasLoRA("wo"))
+    appendLoRAProps(o_params);
+  else if (LORA_RANK > 0)
+    o_params.push_back(withKey("trainable", "false"));
   layers.push_back(createLayer("fully_connected", o_params));
 
   return layers;
@@ -146,75 +141,5 @@ void Qwen3CausalLM::registerCustomLayers() {
   CausalLM::registerCustomLayers();
   Qwen3Transformer::registerCustomLayers();
 }
-
-// // LoRA Debugging
-// void Qwen3CausalLM::exportWeightsToFile(const std::string& filename) const {
-//   std::ofstream outfile(filename);
-//   if (!outfile.is_open()) {
-//     std::cerr << "Failed to open file for writing: " << filename << std::endl;
-//     return;
-//   }
-  
-//   outfile << std::fixed << std::setprecision(6);
-//   outfile << "=== Detailed Model Weights Export ===" << std::endl;
-//   outfile << "Export Time: " << std::time(nullptr) << std::endl;
-//   outfile << "=====================================" << std::endl << std::endl;
-  
-//   if (!model) {
-//     outfile << "Error: Model is not initialized" << std::endl;
-//     outfile.close();
-//     return;
-//   }
-  
-//   // Use the forEachLayer method to iterate through all layers
-//   model->forEachLayer(
-//     [](ml::train::Layer &layer, nntrainer::RunLayerContext &rc, void *user_data) {
-//       std::ofstream &outfile = *static_cast<std::ofstream*>(user_data);
-      
-//       outfile << "Layer: " << layer.getName() << " (Type: " << layer.getType() << ")\n";
-      
-//       try {
-//         // Get weights using the layer interface
-//         std::vector<float*> weights;
-//         std::vector<ml::train::TensorDim> weight_dims;
-//         layer.getWeights(weights, weight_dims);
-        
-//         for (size_t i = 0; i < weights.size(); ++i) {
-//           if (weights[i] && weight_dims[i].getFeatureLen() > 0) {
-//             outfile << "  Weight " << i << " (Name: " << layer.getWeightName(i) 
-//                     << ", Dim: " << weight_dims[i].getFeatureLen() << "): ";
-            
-//             // Print first 10 and last 10 values for large weights
-//             size_t len = weight_dims[i].getFeatureLen();
-//             size_t print_count = std::min(len, (size_t)20);
-            
-//             for (size_t j = 0; j < std::min(print_count/2, len); ++j) {
-//               outfile << weights[i][j] << " ";
-//             }
-            
-//             if (len > print_count) {
-//               outfile << "... ";
-//               for (size_t j = len - print_count/2; j < len; ++j) {
-//                 outfile << weights[i][j] << " ";
-//               }
-//             } else {
-//               for (size_t j = print_count/2; j < len; ++j) {
-//                 outfile << weights[i][j] << " ";
-//               }
-//             }
-//             outfile << "\n";
-//           }
-//         }
-//       } catch (const std::exception& e) {
-//         outfile << "  Error accessing weights: " << e.what() << "\n";
-//       }
-//       outfile << "\n";
-//     },
-//     &outfile
-//   );
-  
-//   outfile.close();
-//   std::cout << "Detailed model weights exported to: " << filename << std::endl;
-// }
 
 } // namespace causallm

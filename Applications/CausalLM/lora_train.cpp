@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 
 namespace causallm {
@@ -30,9 +29,8 @@ TrainingDataGenerator::TrainingDataGenerator(tokenizers::Tokenizer *tokenizer,
 
 void TrainingDataGenerator::loadTextFile(const std::string &path) {
   std::ifstream file(path);
-  if (!file.is_open()) {
+  if (!file.is_open())
     throw std::runtime_error("Failed to open training data file: " + path);
-  }
 
   std::string line;
   int count = 0;
@@ -43,9 +41,8 @@ void TrainingDataGenerator::loadTextFile(const std::string &path) {
     samples_.push_back(ids);
     count++;
   }
-
-  std::cout << "[TrainingData] Loaded " << path
-            << " line by line, total: " << count << " samples." << std::endl;
+  std::cout << "[TrainingData] Loaded " << path << " — " << count
+            << " samples." << std::endl;
 }
 
 void TrainingDataGenerator::addTokenIds(const std::vector<int> &ids) {
@@ -59,60 +56,56 @@ unsigned int TrainingDataGenerator::getNumSamples() const {
 void TrainingDataGenerator::reset() { current_idx_ = 0; }
 
 void TrainingDataGenerator::limitSamples(unsigned int max_samples) {
-  if (max_samples < samples_.size()) {
+  if (max_samples < samples_.size())
     samples_.resize(max_samples);
-  }
 }
 
 int TrainingDataGenerator::dataCb(float **input, float **label, bool *last,
                                   void *user_data) {
   auto *self = static_cast<TrainingDataGenerator *>(user_data);
 
-  if (self->current_idx_ >= self->samples_.size()) {
-    *last = true;
+  // Auto-reset at the start of each new epoch
+  if (self->current_idx_ >= self->samples_.size())
     self->reset();
-    return 0;
-  }
 
   const auto &ids = self->samples_[self->current_idx_];
-  unsigned int available = ids.size();
+  unsigned int available = static_cast<unsigned int>(ids.size());
 
-  // Input: fill seq_len token IDs [t_0, t_1, ..., t_{L-1}, pad, ...]
-  for (unsigned int j = 0; j < self->seq_len_; j++) {
-    if (j < available) {
-      input[0][j] = static_cast<float>(ids[j]);
-    } else {
-      input[0][j] = 0.0f; // pad
-    }
-  }
+  // Label = last token in the sequence (e.g. "Positive" / "Negative").
+  // Input = everything before it, LEFT-padded to seq_len so the last real
+  // token sits at position seq_len-1 (where lm_head reads from).
+  // Right-padding would put the last real token at an early position followed
+  // by many padding tokens, making the lm_head predict from a padding state.
 
-  // Label: single one-hot vector of size VOCAB_SIZE
-  // The lm_head layer collapses the sequence to height=1 (last position),
-  // so NNTrainer allocates the label buffer as [1, 1, 1, VOCAB_SIZE].
-  // Target = next token after the last input position in the sequence.
-  for (unsigned int v = 0; v < self->vocab_size_; ++v) {
-    label[0][v] = 0.0f;
-  }
+  unsigned int label_token = 0;
 
-  // Determine the target token: the token right after our input window
-  unsigned int last_input_pos =
-    std::min(available, (decltype(available))self->seq_len_);
-  if (last_input_pos < available) {
-    unsigned int target_id = ids[last_input_pos];
-    if (target_id < self->vocab_size_) {
-      label[0][target_id] = 1.0f;
-    }
+  if (available >= 2) {
+    label_token = static_cast<unsigned int>(ids[available - 1]);
+
+    unsigned int input_len = available - 1;
+    unsigned int start = (input_len > self->seq_len_) ? (input_len - self->seq_len_) : 0;
+    unsigned int used = input_len - start;
+    unsigned int pad  = self->seq_len_ - used;
+
+    for (unsigned int j = 0; j < pad; ++j)
+      input[0][j] = 0.0f;
+    for (unsigned int j = 0; j < used; ++j)
+      input[0][pad + j] = static_cast<float>(ids[start + j]);
   } else {
-    // No next token available (sequence ended), predict pad/eos (token 0)
-    label[0][0] = 1.0f;
+    for (unsigned int j = 0; j < self->seq_len_; ++j)
+      input[0][j] = 0.0f;
   }
 
-  // Progress printing
-  std::cout << "[DataGen] Sample " << self->current_idx_ << " / "
-            << self->samples_.size() << std::endl;
+  for (unsigned int v = 0; v < self->vocab_size_; ++v)
+    label[0][v] = 0.0f;
+  if (label_token < self->vocab_size_)
+    label[0][label_token] = 1.0f;
+
+  std::cout << "[DataGen] sample " << self->current_idx_ << " / "
+            << self->samples_.size() << "\r" << std::flush;
 
   self->current_idx_++;
-  *last = false;
+  *last = (self->current_idx_ >= self->samples_.size());
   return 0;
 }
 

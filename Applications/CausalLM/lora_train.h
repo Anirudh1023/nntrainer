@@ -44,39 +44,30 @@ public:
                         unsigned int vocab_size);
 
   /**
-   * @brief Load training text from a file
-   * @param path Path to the text file
+   * @brief Load training text from a file (one sample per line)
    */
   void loadTextFile(const std::string &path);
 
   /**
    * @brief Add pre-tokenized IDs directly
-   * @param ids Vector of token IDs
    */
   void addTokenIds(const std::vector<int> &ids);
 
   /**
-   * @brief Get the number of training samples
+   * @brief Get the number of loaded training samples
    */
   unsigned int getNumSamples() const;
 
   /**
-   * @brief Limit the number of training samples
-   * @param max_samples Maximum number of samples to keep
+   * @brief Keep only the first max_samples samples
    */
   void limitSamples(unsigned int max_samples);
 
   /**
-   * @brief Data generation callback for nntrainer's dataset API
+   * @brief Data callback for ml::train::createDataset(GENERATOR, dataCb, this)
    *
-   * This is the callback signature expected by ml::train::createDataset
-   * with DatasetType::GENERATOR.
-   *
-   * @param[out] input Pointer to input buffer (seq_len floats)
-   * @param[out] label Pointer to label buffer (seq_len floats)
-   * @param[out] last Set to true when epoch is complete
-   * @param[in] user_data Pointer to TrainingDataGenerator instance
-   * @return 0 on success
+   * Input  buffer: seq_len floats (token IDs, zero-padded)
+   * Label  buffer: vocab_size floats (one-hot next-token)
    */
   static int dataCb(float **input, float **label, bool *last, void *user_data);
 

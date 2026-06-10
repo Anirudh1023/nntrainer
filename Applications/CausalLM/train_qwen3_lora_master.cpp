@@ -1,192 +1,152 @@
 // SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   train_qwen3_lora_master.cpp
+ * @brief  Entry point for Qwen3-0.6B LoRA fine-tuning
+ *
+ * Usage:
+ *   train_qwen3_lora_master <model_dir> <train_data.txt>
+ *       [--lr <float>] [--epochs <int>]
+ *       [--output <path>] [--lora_path <path>]
+ *       [--max_samples <int>] [--skip_weights]
+ */
 
-#include <cstdlib>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
 
 #include <causal_lm.h>
+#include <dataset.h>
 #include <lora_train.h>
+#include <model.h>
 #include <transformer.h>
-#include <factory.h>
 
 #include "json.hpp"
 #include "qwen3_causallm.h"
-
-#include <dataset.h>
-#include <model.h>
-#include <profiler.h>
 
 using json = nlohmann::json;
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {
     std::cerr << "Usage: " << argv[0]
-              << " <model_dir> <train_data.txt> [--lr <float>] [--epochs <int>]"
-                 " [--output <path>] [--lora_path <path>] [--max_samples <int>] [--skip_weights]"
-              << std::endl;
+              << " <model_dir> <train_data.txt>"
+                 " [--lr <float>] [--epochs <int>]"
+                 " [--output <path>] [--lora_path <path>]"
+                 " [--max_samples <int>] [--skip_weights]\n";
     return 1;
   }
 
-  std::string model_dir = argv[1];
+  std::string model_dir       = argv[1];
   std::string train_data_path = argv[2];
-  float lr = 1e-4f;
-  unsigned int epochs = 1;
-  std::string output_path = "model_weights.bin";
-  std::string lora_path = "";  // path to LoRA weights file
-  int max_samples = -1;       // -1 = use all samples
-  bool skip_weights = false;  // skip loading pre-trained weights
+  float lr                    = 1e-4f;
+  unsigned int epochs         = 1;
+  std::string output_path     = "lora_weights.bin";
+  std::string lora_path;
+  int max_samples  = -1;
+  bool skip_weights = false;
 
-  for (int i = 3; i < argc; i++) {
+  for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--lr" && i + 1 < argc) {
+    if (arg == "--lr" && i + 1 < argc)
       lr = std::atof(argv[++i]);
-    } else if (arg == "--epochs" && i + 1 < argc) {
-      epochs = std::atoi(argv[++i]);
-    } else if (arg == "--output" && i + 1 < argc) {
+    else if (arg == "--epochs" && i + 1 < argc)
+      epochs = static_cast<unsigned int>(std::atoi(argv[++i]));
+    else if (arg == "--output" && i + 1 < argc)
       output_path = argv[++i];
-    } else if (arg == "--lora_path" && i + 1 < argc) {
+    else if (arg == "--lora_path" && i + 1 < argc)
       lora_path = argv[++i];
-    } else if (arg == "--max_samples" && i + 1 < argc) {
+    else if (arg == "--max_samples" && i + 1 < argc)
       max_samples = std::atoi(argv[++i]);
-    } else if (arg == "--skip_weights") {
+    else if (arg == "--skip_weights")
       skip_weights = true;
-    }
   }
 
   try {
-    // Setup built-in NNTrainer memory profiler (active only with -Denable-profile=true)
-    auto profiler_listener = std::make_shared<nntrainer::profile::GenericProfileListener>();
-    PROFILE_BEGIN(profiler_listener);
-
-    std::string config_path = model_dir + "/config.json";
+    std::string config_path    = model_dir + "/config.json";
     std::string gen_config_path = model_dir + "/generation_config.json";
     std::string nntr_config_path = model_dir + "/nntr_config.json";
 
-    auto cfg = causallm::LoadJsonFile(config_path);
-    auto gen_cfg = causallm::LoadJsonFile(gen_config_path);
+    auto cfg      = causallm::LoadJsonFile(config_path);
+    auto gen_cfg  = causallm::LoadJsonFile(gen_config_path);
     auto nntr_cfg = causallm::LoadJsonFile(nntr_config_path);
 
-    std::cout << "=== Qwen3 LoRA Training Master ===" << std::endl;
-    std::cout << "Model dir: " << model_dir << std::endl;
-    std::cout << "Train data: " << train_data_path << std::endl;
+    std::cout << "=== Qwen3 LoRA Training ===\n";
+    std::cout << "Model dir : " << model_dir << "\n";
+    std::cout << "Train data: " << train_data_path << "\n";
+    std::cout << "LR=" << lr << "  epochs=" << epochs << "\n\n";
 
-    // =========================================================================
-    // HARDCODED LORA INJECTION
-    // By modifying the JSON object directly in C++ memory BEFORE passing it to
-    // the model builder, we programmatically force Qwen3 to use LoRA on all 
-    // relevant linear projections!
-    // =========================================================================
-    std::cout << "\n[LoRA Master] Programmatically injecting LoRA configurations..." << std::endl;
-    
-    nntr_cfg["lora_rank"] = 8;
-    nntr_cfg["lora_alpha"] = 16;
-    
-    // Qwen3's transformer.cpp uses fc_layer exclusively for:
-    // Attention: wq, wk, wv, wo
-    // MLP: ffn_up, ffn_down, ffn_gate
-    nntr_cfg["lora_target"] = json::array({"wq", "wk", "wv", "wo", "ffn_up", "ffn_down", "ffn_gate"});
-    
-    std::cout << "[LoRA Master] LoRA Rank & Alpha explicitly forced to: " << nntr_cfg["lora_rank"] << ", " << nntr_cfg["lora_alpha"] << std::endl;
-    std::cout << "[LoRA Master] LoRA Targets configured: " << nntr_cfg["lora_target"].dump() << "\n" << std::endl;
-
-    // Use Factory if wanted or initialize Qwen3 directly:
-    auto model = std::make_unique<causallm::Qwen3CausalLM>(cfg, gen_cfg, nntr_cfg);
-    if (!model) {
-      std::cerr << "Failed to allocate Qwen3CausalLM" << std::endl;
-      return 1;
+    // Inject LoRA config into nntr_cfg (override JSON in memory)
+    if (!nntr_cfg.contains("lora_rank") || nntr_cfg["lora_rank"] == 0) {
+      std::cout << "[LoRA] Injecting default LoRA config (rank=8, alpha=16).\n";
+      nntr_cfg["lora_rank"]  = 8;
+      nntr_cfg["lora_alpha"] = 16;
+      nntr_cfg["lora_target"] =
+        json::array({"wq", "wk", "wv", "wo", "ffn_up", "ffn_down", "ffn_gate"});
     }
+    std::cout << "[LoRA] rank=" << nntr_cfg["lora_rank"]
+              << "  alpha=" << nntr_cfg["lora_alpha"]
+              << "  targets=" << nntr_cfg["lora_target"].dump() << "\n\n";
 
+    auto model = std::make_unique<causallm::Qwen3CausalLM>(cfg, gen_cfg, nntr_cfg);
     model->initializeForTraining(lr, epochs);
 
     if (!skip_weights && nntr_cfg.contains("model_file_name")) {
-      std::string weight_path = model_dir + "/" + nntr_cfg["model_file_name"].get<std::string>();
-      std::cout << "Loading initial weights from: " << weight_path << std::endl;
+      std::string weight_path =
+        model_dir + "/" + nntr_cfg["model_file_name"].get<std::string>();
+      std::cout << "Loading weights: " << weight_path << "\n";
       if (!lora_path.empty()) {
-        std::cout << "Loading LoRA weights from: " << lora_path << std::endl;
+        std::cout << "Loading LoRA overlay: " << lora_path << "\n";
         model->load_weight_lora(weight_path, lora_path);
       } else {
         model->load_weight(weight_path);
       }
     } else {
-      std::cout << "Skipping weight loading (using random initialization)." << std::endl;
+      std::cout << "Skipping weight load (random init).\n";
     }
 
-    std::string tokenizer_path = "";
-    if (nntr_cfg.contains("tokenizer_file")) {
+    // Build tokenizer
+    std::string tokenizer_path = model_dir + "/tokenizer.json";
+    if (nntr_cfg.contains("tokenizer_file"))
       tokenizer_path = nntr_cfg["tokenizer_file"].get<std::string>();
-    }
-    if (tokenizer_path.empty()) {
-      tokenizer_path = model_dir + "/tokenizer.json";
-      std::cout << "tokenizer_file not set, using: " << tokenizer_path << std::endl;
-    }
-    auto tokenizer_blob = causallm::LoadBytesFromFile(tokenizer_path);
-    auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(tokenizer_blob);
+    auto blob      = causallm::LoadBytesFromFile(tokenizer_path);
+    auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(blob);
 
-    unsigned int seq_len = nntr_cfg["init_seq_len"].get<unsigned int>();
+    unsigned int seq_len   = nntr_cfg["init_seq_len"].get<unsigned int>();
     unsigned int vocab_size = cfg["vocab_size"].get<unsigned int>();
-    
+
     causallm::TrainingDataGenerator data_gen(tokenizer.get(), seq_len, vocab_size);
     data_gen.loadTextFile(train_data_path);
 
-    if (max_samples > 0 && (unsigned int)max_samples < data_gen.getNumSamples()) {
-      std::cout << "Limiting training samples from " << data_gen.getNumSamples()
-                << " to " << max_samples << std::endl;
-      data_gen.limitSamples(max_samples);
+    if (max_samples > 0 &&
+        static_cast<unsigned int>(max_samples) < data_gen.getNumSamples()) {
+      std::cout << "Limiting to " << max_samples << " samples.\n";
+      data_gen.limitSamples(static_cast<unsigned int>(max_samples));
     }
-
     if (data_gen.getNumSamples() == 0) {
-      std::cerr << "Error: Not enough training data (need > 0 lines)" << std::endl;
+      std::cerr << "Error: no training samples loaded.\n";
       return 1;
     }
+    std::cout << "Training samples: " << data_gen.getNumSamples() << "\n\n";
 
-    auto dataset_train = std::shared_ptr<ml::train::Dataset>(ml::train::createDataset(
-        ml::train::DatasetType::GENERATOR, causallm::TrainingDataGenerator::dataCb, &data_gen));
-    
-    model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset_train);
+    auto dataset = std::shared_ptr<ml::train::Dataset>(
+      ml::train::createDataset(ml::train::DatasetType::GENERATOR,
+                               causallm::TrainingDataGenerator::dataCb,
+                               &data_gen));
+    model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset);
 
-    std::cout << "\n=== Starting Qwen3 LoRA full model training ===" << std::endl;
-    auto train_start = std::chrono::steady_clock::now();
-
-    std::cout << "\n=== NNTrainer Model Summary (Checking Trainable vs Frozen Layers) ===" << std::endl;
-    model->summarize(std::cout, ML_TRAIN_SUMMARY_TENSOR);
-    std::cout << "==================================================================\n" << std::endl;
-
-    // For checking if only LoRA layers are being updated or not
-    std::cout << "\n=== Saving model weights BEFORE training ===" << std::endl;
-    model->exportWeightsToFile("model_weights_before_training_LORA.txt");
-
+    std::cout << "\n=== Starting training ===\n";
+    auto t0 = std::chrono::steady_clock::now();
     model->train();
-    auto train_end = std::chrono::steady_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(train_end - train_start).count();
+    double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "\nTraining done in " << elapsed << " s.\n";
 
-    std::cout << "\nTraining completed in " << elapsed_sec << " seconds." << std::endl;
-    // For checking if only LoRA layers are being updated or not
-    std::cout << "\n=== Saving model weights AFTER training ===" << std::endl;
-    model->exportWeightsToFile("model_weights_after_training_LORA.txt");
-    
-    // Print memory profiling report (only produces output with -Denable-profile=true)
-    std::cout << "\n=== NNTrainer Memory Profile Report (LoRA Training) ===" << std::endl;
-    PROFILE_END(profiler_listener);
-    std::cout << "======================================================\n" << std::endl;
-
-    try {
-      if(nntr_cfg["lora_alpha"] != 0) {
-        model->save_weight(output_path,  ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN);
-        std::cout << "LoRA Weights saved to: " << output_path << std::endl;
-      }
-      else {
-        model->save_weight(output_path,  ml::train::ModelFormat::MODEL_FORMAT_BIN);
-        std::cout << "Base weights saved to: " << output_path << std::endl;
-      }
-    } catch (const std::exception &e) {
-      std::cerr << "Warning: Could not save binary weights: " << e.what() << std::endl;
-      std::cerr << "  (Text weight exports above are still valid for comparison.)" << std::endl;
-    }
+    model->save_weight_lora(output_path);
+    std::cout << "LoRA weights saved to: " << output_path << "\n";
 
   } catch (const std::exception &e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+    std::cerr << "Error: " << e.what() << "\n";
     return 1;
   }
 

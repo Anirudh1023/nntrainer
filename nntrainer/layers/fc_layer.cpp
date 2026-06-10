@@ -110,6 +110,8 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
 
+  // Base weight is trainable only when LoRA is not active for this layer.
+  // When lora_rank > 0, only loraA/loraB update; W is frozen.
   weight_idx[FCParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "weight", (lora_rank == 0));
@@ -227,7 +229,6 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     hidden_tmp_lora.dot(loraB, hidden_out_lora, false, false);
     hidden_out_lora.multiply_i(lora_scaling);
     hidden_.add_i(hidden_out_lora);
-    std::cout << "Entered LoRA condition for the layer: " << context.getName() << std::endl;
   }
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);

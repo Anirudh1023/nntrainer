@@ -256,15 +256,6 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
-   * @brief apply inverse rotary embedding
-   * @param[in] tensor tensor to apply
-   * @param[in] dim dimension of head
-   * @param[in] from sequence order
-   */
-  void apply_inverse_rotary_emb(nntrainer::Tensor &tensor, unsigned int dim,
-                                unsigned int from);
-
-  /**
    * @copydoc Layer::calcGradient(RunLayerContext &context)
    */
   WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
@@ -355,15 +346,13 @@ private:
     cache_value,
     projected_key,
     projected_value,
-    /** intended comment for later use of attention_mask */
-    // attention_mask,
     attention_weight,
     dropout_mask,
     attention_output,
-    train_query,
-    train_key,
-    train_value,
-    train_attn_wt,
+    train_query,   // (B, H_Q, seq_len, head_dim) — cached for backward
+    train_key,     // (B, H_KV, seq_len, head_dim)
+    train_value,   // (B, H_KV, seq_len, head_dim)
+    train_attn_wt, // (B*H_Q, 1, seq_len, seq_len) — softmax weights
   };
   std::array<unsigned int, 11> tensor_idx;
   unsigned int sink_idx;
@@ -416,6 +405,9 @@ private:
    * @param[in] from sequence order
    * @param[in] convert_only - conversion only
    */
+  void apply_inverse_rotary_emb(nntrainer::Tensor &tensor, unsigned int dim,
+                               unsigned int from);
+
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
                                   bool convert_only = false);

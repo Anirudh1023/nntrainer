@@ -35,6 +35,7 @@
 #endif
 
 #include <layer.h>
+#include <map>
 #include <model.h>
 #include <random>
 
@@ -81,16 +82,17 @@ public:
   virtual ~Transformer() {}
 
   /**
-   * @brief Initialize and Construct the Transformer model for inference
+   * @brief Initialize and Construct the Transformer model (inference mode)
    */
   virtual void initialize();
 
   /**
-   * @brief Initialize and Construct the Transformer model for training
-   * @param lr Learning rate for the optimizer
+   * @brief Initialize model for LoRA fine-tuning (training mode).
+   *        Adds cross_softmax loss, Adam optimizer, compiles in TRAIN mode.
+   * @param lr   Learning rate for Adam optimizer
    * @param epochs Number of training epochs
    */
-  virtual void initializeForTraining(float lr = 1e-4, unsigned int epochs = 1);
+  virtual void initializeForTraining(float lr, unsigned int epochs);
 
   /**
    * @brief Load the model weights from a file
@@ -98,27 +100,55 @@ public:
   virtual void load_weight(const std::string &weight_path);
 
   /**
-   * @brief Load the model weights along with lora weights
-   */
-  virtual void load_weight_lora(const std::string &weight_path, const std::string &lora_path);
-
-
-  /**
    * @brief Save the weight to a file
    */
-  virtual void save_weight(const std::string &weight_path,  ml::train::ModelFormat format);
+  virtual void save_weight(const std::string &weight_path);
 
-  // /**
-  //  * @brief Save the weight to a file with type conversion
-  //  * @param weight_path Path to save the weight file
-  //  * @param dtype Global target data type for all layers (NONE = keep original)
-  //  * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
-  //  */
-  // virtual void
-  // save_weight(const std::string &weight_path,
-  //             ml::train::TensorDim::DataType dtype,
-  //             const std::map<std::string, ml::train::TensorDim::DataType>
-  //               &layer_dtype_map = {});
+  /**
+   * @brief Save only LoRA adapter weights (loraA/loraB) to a file.
+   *        For use after LoRA training.
+   */
+  virtual void save_weight_lora(const std::string &weight_path);
+
+  /**
+   * @brief Load base weights, then overlay LoRA adapter weights on top.
+   */
+  virtual void load_weight_lora(const std::string &base_path,
+                                const std::string &lora_path);
+
+  /**
+   * @brief Set a dataset on the underlying nntrainer model.
+   */
+  virtual void
+  setDataset(const ml::train::DatasetModeType &mode,
+             std::shared_ptr<ml::train::Dataset> dataset);
+
+  /**
+   * @brief Run training on the model (wraps model->train()).
+   */
+  virtual void train();
+
+  /**
+   * @brief Print model summary to a stream.
+   */
+  virtual void summarize(std::ostream &out, unsigned int type);
+
+  /**
+   * @brief Export weight names and norms to a text file for debugging.
+   */
+  virtual void exportWeightsToFile(const std::string &path);
+
+  /**
+   * @brief Save the weight to a file with type conversion
+   * @param weight_path Path to save the weight file
+   * @param dtype Global target data type for all layers (NONE = keep original)
+   * @param layer_dtype_map Per-layer data type overrides (layer_name -> dtype)
+   */
+  virtual void
+  save_weight(const std::string &weight_path,
+              ml::train::TensorDim::DataType dtype,
+              const std::map<std::string, ml::train::TensorDim::DataType>
+                &layer_dtype_map = {});
 
   /**
    * @brief run the Transformer model
@@ -133,45 +163,6 @@ public:
   PerformanceMetrics getPerformanceMetrics() const {
     return performance_metrics;
   }
-
-  /**
-   * @brief Summarize model structure and trainable parameters
-   */
-  void summarize(std::ostream &out, ml_train_summary_type_e verbosity = ML_TRAIN_SUMMARY_LAYER) {
-    if (model) {
-      model->summarize(out, verbosity);
-    }
-  }
-
-  /**
-   * @brief Get the training loss from the underlying nntrainer model
-   */
-  float getTrainingLoss() const {
-    if (!model) return 0.0f;
-    return model->getTrainingLoss();
-  }
-
-  /**
-   * @brief Configure dataset for the model
-   */
-  virtual void setDataset(ml::train::DatasetModeType mode, std::shared_ptr<ml::train::Dataset> dataset) {
-    if (!model) throw std::invalid_argument("Model is not initialized");
-    model->setDataset(mode, std::move(dataset));
-  }
-
-  /**
-   * @brief Train the model
-   */
-  virtual void train(const std::vector<std::string> &values = {}) {
-    if (!model)
-      throw std::invalid_argument("Model is not initialized");
-    model->train(values);
-  }
-
-  /**
-   * @brief LoRA Debugging
-   */
-  void exportWeightsToFile(const std::string& filename) const; 
 
 protected:
   /**
@@ -209,6 +200,17 @@ protected:
    * @brief register CustomLayers
    */
   virtual void registerCustomLayers();
+
+  /**
+   * @brief Returns true if module_type (e.g. "q_proj") is in LORA_TARGET and
+   * LORA_RANK > 0.
+   */
+  bool hasLoRA(const std::string &module_type) const;
+
+  /**
+   * @brief Append lora_rank (and lora_alpha if set) to a layer property list.
+   */
+  void appendLoRAProps(std::vector<std::string> &props) const;
 
   /**
    * @brief register Outputs
@@ -249,35 +251,22 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
 
-  /** LoRA parameters */
-  unsigned int LORA_RANK = 0;             /**< LoRA rank (0 = disabled) */
-  unsigned int LORA_ALPHA = 0;            /**< LoRA alpha for scaling */
-  std::vector<std::string> LORA_TARGETS;  /**< Target layer names for LoRA */
-
-  /**
-   * @brief Check if LoRA should be applied to a layer
-   * @param layer_suffix The suffix identifying the layer type (e.g., "wq",
-   * "ffn_down")
-   * @return true if LoRA is enabled and this layer is a target
-   */
-  bool isLoRATarget(const std::string &layer_suffix) const;
+  unsigned int LORA_RANK = 0;  /**< LoRA rank (0 = disabled) */
+  unsigned int LORA_ALPHA = 0; /**< LoRA alpha (0 = use scaling=1) */
+  std::vector<std::string> LORA_TARGET; /**< module names to apply LoRA to,
+                                            e.g. {"q_proj","v_proj"} */
 
   // Performance metrics
   PerformanceMetrics performance_metrics;
 };
-/**
- * @brief Loads raw bytes from a file as a string
- * @param path Path to the file
- * @return File contents as a string
- */
-std::string LoadBytesFromFile(const std::string &path);
-
 /**
  * Loads JSON data from a file with detailed error handling
  * @param file_path Path to JSON file
  * @return JSON object
  * @throws std::runtime_error on file open or parse failure
  */
+std::string LoadBytesFromFile(const std::string &path);
+
 inline json LoadJsonFile(const std::string &file_path) {
   std::ifstream file(file_path);
   if (!file.is_open()) {
