@@ -130,14 +130,12 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   inv_rms_step_dim.height(step_height);
 
   for (unsigned int b = 0; b < b_size; ++b) {
-    // Correct from offset applied so multi-step generation reads/writes
-    // the right position rather than always starting from 0.
     nntrainer::Tensor in_step = in.getSharedDataTensor(
-      in_step_dim, b * in_dim.getFeatureLen() + from * in_dim.width(), true);
+      in_step_dim, b * in_dim.getFeatureLen(), true);
     nntrainer::Tensor out_step = out.getSharedDataTensor(
-      out_step_dim, b * out_dim.getFeatureLen() + from * out_dim.width(), true);
+      out_step_dim, b * out_dim.getFeatureLen(), true);
     nntrainer::Tensor inv_rms_step = inv_rms.getSharedDataTensor(
-      inv_rms_step_dim, b * inv_rms_dim.getFeatureLen() + from, true);
+      inv_rms_step_dim, b * inv_rms_dim.getFeatureLen(), true);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       // Compute inv_rms and write into cache slice
