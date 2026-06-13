@@ -34,6 +34,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <functional>
 #include <layer.h>
 #include <map>
 #include <model.h>
@@ -127,6 +128,28 @@ public:
    * @brief Run training on the model (wraps model->train()).
    */
   virtual void train();
+
+  /**
+   * @brief Run training with an epoch-end callback and optional early-stop
+   *        predicate.
+   * @param epoch_cb   Called at the end of each epoch (after stats are updated).
+   * @param epoch_data Passed as-is to epoch_cb.
+   * @param stop_cb    Returns true to stop training early. nullptr = never stop.
+   * @param stop_data  Passed as-is to stop_cb.
+   */
+  virtual void train(std::function<void(void *)> epoch_cb, void *epoch_data,
+                     std::function<bool(void *)> stop_cb = nullptr,
+                     void *stop_data = nullptr);
+
+  /**
+   * @brief Return training stats from the last completed epoch.
+   */
+  virtual ml::train::RunStats getTrainingStats();
+
+  /**
+   * @brief Return validation stats from the last completed epoch.
+   */
+  virtual ml::train::RunStats getValidStats();
 
   /**
    * @brief Print model summary to a stream.

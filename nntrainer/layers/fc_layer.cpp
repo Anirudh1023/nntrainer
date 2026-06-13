@@ -126,17 +126,19 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   if (lora_rank) {
 
     /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
+    // LoRA adapters are always FP32 regardless of the base weight dtype
+    // (Q4_0/Q4_K etc. would reject rank=8 as width since 8 % 32 != 0)
     TensorDim loraA_dim(
       1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
       is_nchw ? lora_rank : in_dim.channel(),
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      TensorDim::TensorType(context.getFormat(), TensorDim::DataType::FP32),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraB Dimension : (1, 1, lora_rank, unit) */
     TensorDim loraB_dim(
       1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
       is_nchw ? unit : lora_rank,
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      TensorDim::TensorType(context.getFormat(), TensorDim::DataType::FP32),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
@@ -156,11 +158,11 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
       is_nchw ? 0b1011 : 0b1101);
 
     lora_idx[LORAParams::loraA] = context.requestWeight(
-      loraA_dim, Initializer::ZEROS, weight_regularizer,
+      loraA_dim, Initializer::LECUN_NORMAL, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraA", true);
 
     lora_idx[LORAParams::loraB] = context.requestWeight(
-      loraB_dim, Initializer::LECUN_NORMAL, weight_regularizer,
+      loraB_dim, Initializer::ZEROS, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraB", true);
 
     lora_idx[LORAParams::loraTmp] =
@@ -319,7 +321,17 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     Tensor &lora_A = context.getWeight(lora_idx[LORAParams::loraA]);
     Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
-    ret_.dot_deriv_wrt_1(weight.add(lora_A.dot(lora_B).multiply(lora_scaling)),
+    Tensor w_fp32;
+    using DT = TensorDim::DataType;
+    if (quantizer != nullptr) {
+      w_fp32 = quantizer->dequantize(weight, lora_A.getDataType());
+    } else if (weight.getDataType() == DT::Q4_0) {
+      auto dq = Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+      w_fp32 = dq->dequantize(weight, DT::FP32);
+    } else {
+      w_fp32 = weight;
+    }
+    ret_.dot_deriv_wrt_1(w_fp32.add(lora_A.dot(lora_B).multiply(lora_scaling)),
                          derivative_, false, false);
   } else {
     ret_.dot_deriv_wrt_1(weight, derivative_, false, false);
@@ -371,7 +383,7 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraB]));
     djdtmp.dot_deriv_wrt_1(
       loraB, lora_derivative_, false, false,
-      !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+      false);
     input_.dot_deriv_wrt_2(
       djdla, djdtmp, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraA]));

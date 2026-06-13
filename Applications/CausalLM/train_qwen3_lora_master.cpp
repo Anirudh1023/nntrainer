@@ -11,8 +11,10 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -43,8 +45,9 @@ int main(int argc, char *argv[]) {
   unsigned int epochs         = 1;
   std::string output_path     = "lora_weights.bin";
   std::string lora_path;
-  int max_samples  = -1;
+  int max_samples   = -1;
   bool skip_weights = false;
+  unsigned int patience = 5;
 
   for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
@@ -60,6 +63,8 @@ int main(int argc, char *argv[]) {
       max_samples = std::atoi(argv[++i]);
     else if (arg == "--skip_weights")
       skip_weights = true;
+    else if (arg == "--patience" && i + 1 < argc)
+      patience = static_cast<unsigned int>(std::atoi(argv[++i]));
   }
 
   try {
@@ -74,7 +79,8 @@ int main(int argc, char *argv[]) {
     std::cout << "=== Qwen3 LoRA Training ===\n";
     std::cout << "Model dir : " << model_dir << "\n";
     std::cout << "Train data: " << train_data_path << "\n";
-    std::cout << "LR=" << lr << "  epochs=" << epochs << "\n\n";
+    std::cout << "LR=" << lr << "  epochs=" << epochs
+              << "  patience=" << patience << "\n\n";
 
     // Inject LoRA config into nntr_cfg (override JSON in memory)
     if (!nntr_cfg.contains("lora_rank") || nntr_cfg["lora_rank"] == 0) {
@@ -134,15 +140,74 @@ int main(int argc, char *argv[]) {
                                causallm::TrainingDataGenerator::dataCb,
                                &data_gen));
     model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset);
+    // Same data used for accuracy tracking after each epoch
+    model->setDataset(ml::train::DatasetModeType::MODE_VALID, dataset);
+
+    // Epoch callback: cumulative loss + perplexity + early stopping.
+    // Accuracy is always ~0% for next-token top-1 with vocab_size=151936;
+    // perplexity (exp(loss)) is the meaningful language-model metric.
+    struct CumStats {
+      causallm::Qwen3CausalLM *mdl;
+      unsigned int epoch_count  = 0;
+      float cumulative_loss     = 0.0f;
+      // early stopping
+      unsigned int patience;
+      unsigned int patience_left;
+      float best_val_loss       = std::numeric_limits<float>::max();
+      unsigned int best_epoch   = 0;
+      bool stop_flag            = false;
+      std::string output_path;
+    };
+    CumStats cum{model.get()};
+    cum.patience      = patience;
+    cum.patience_left = patience;
+    cum.output_path   = output_path;
+
+    auto epoch_cb = [](void *ud) {
+      auto *c = static_cast<CumStats *>(ud);
+      c->epoch_count++;
+      auto ts = c->mdl->getTrainingStats();
+      auto vs = c->mdl->getValidStats();
+      c->cumulative_loss += ts.loss;
+      float avg     = c->cumulative_loss / static_cast<float>(c->epoch_count);
+      float ppl     = std::exp(ts.loss);
+      float cum_ppl = std::exp(avg);
+      std::cout << "  Cumulative | AvgLoss: " << avg
+                << "  CumPPL: " << cum_ppl
+                << "  EpochPPL: " << ppl << "\n";
+
+      // Early stopping: track best validation loss
+      if (vs.loss < c->best_val_loss) {
+        c->best_val_loss   = vs.loss;
+        c->best_epoch      = c->epoch_count;
+        c->patience_left   = c->patience;
+        c->mdl->save_weight_lora(c->output_path);
+        std::cout << "  [Best] val_loss=" << vs.loss
+                  << " at epoch " << c->epoch_count
+                  << " -> checkpoint saved\n";
+      } else {
+        c->patience_left--;
+        std::cout << "  [EarlyStopping] No improvement. patience="
+                  << c->patience_left << "/" << c->patience << "\n";
+        if (c->patience_left == 0)
+          c->stop_flag = true;
+      }
+    };
+
+    auto stop_cb = [](void *ud) -> bool {
+      return static_cast<CumStats *>(ud)->stop_flag;
+    };
 
     std::cout << "\n=== Starting training ===\n";
     auto t0 = std::chrono::steady_clock::now();
-    model->train();
+    model->train(epoch_cb, &cum, stop_cb, &cum);
     double elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::cout << "\nTraining done in " << elapsed << " s.\n";
 
-    model->save_weight_lora(output_path);
+    std::cout << "\nTraining done in " << elapsed << " s.\n";
+    std::cout << "Best checkpoint: epoch " << cum.best_epoch
+              << "  val_loss=" << cum.best_val_loss
+              << "  val_PPL=" << std::exp(cum.best_val_loss) << "\n";
     std::cout << "LoRA weights saved to: " << output_path << "\n";
 
   } catch (const std::exception &e) {

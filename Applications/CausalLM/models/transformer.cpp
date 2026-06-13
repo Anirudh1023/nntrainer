@@ -320,6 +320,24 @@ static std::vector<std::string> buildOrderedLayerNames(int num_layers) {
   return names;
 }
 
+// Returns the byte count that the nntrainer .bin serialiser writes for a
+// weight tensor.  Block-quantised formats have sub-byte per-element cost, so
+// getDataLen() * getDataTypeSize() is wrong for Q4_0, Q4_K, Q6_K.
+static size_t weight_bytes(const ml::train::TensorDim &dim) {
+  using DT = ml::train::TensorDim::DataType;
+  size_t n = static_cast<size_t>(dim.getDataLen());
+  switch (dim.getDataType()) {
+  case DT::Q4_0:
+    return (n / 32) * 18; // block_q4_0: 32 elems → 2B scale + 16B nibbles
+  case DT::Q4_K:
+    return (n / 256) * 144; // block_q4_K: 256 elems → 144 bytes
+  case DT::Q6_K:
+    return (n / 256) * 210; // block_q6_K: 256 elems → 210 bytes
+  default:
+    return n * dim.getDataTypeSize();
+  }
+}
+
 void Transformer::load_weight(const std::string &weight_path) {
 
   if (!is_initialized) {
@@ -374,7 +392,7 @@ void Transformer::load_weight(const std::string &weight_path) {
       if (is_lora)
         continue; // Skip: not in pretrained file. Keeps initialized value.
 
-      size_t bytes = static_cast<size_t>(wdims[wi].getDataLen()) * sizeof(float);
+      size_t bytes = weight_bytes(wdims[wi]);
       f.read(reinterpret_cast<char *>(wdata[wi]), bytes);
       if (!f)
         throw std::runtime_error("load_weight: read failed at weight '" +
@@ -516,6 +534,23 @@ void Transformer::train() {
     throw std::runtime_error("Model not initialized before train().");
   if (model->train())
     throw std::runtime_error("model->train() returned error.");
+}
+
+void Transformer::train(std::function<void(void *)> epoch_cb, void *epoch_data,
+                        std::function<bool(void *)> stop_cb, void *stop_data) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before train().");
+  auto actual_stop = stop_cb ? stop_cb : [](void *) -> bool { return false; };
+  if (model->train({}, actual_stop, stop_data, epoch_cb, epoch_data))
+    throw std::runtime_error("model->train() returned error.");
+}
+
+ml::train::RunStats Transformer::getTrainingStats() {
+  return model->getTrainingStats();
+}
+
+ml::train::RunStats Transformer::getValidStats() {
+  return model->getValidStats();
 }
 
 void Transformer::summarize(std::ostream &out, unsigned int type) {
