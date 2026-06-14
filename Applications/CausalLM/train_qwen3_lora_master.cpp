@@ -48,6 +48,7 @@ int main(int argc, char *argv[]) {
   int max_samples   = -1;
   bool skip_weights = false;
   unsigned int patience = 5;
+  bool lora_qat = false;
 
   for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
@@ -65,6 +66,8 @@ int main(int argc, char *argv[]) {
       skip_weights = true;
     else if (arg == "--patience" && i + 1 < argc)
       patience = static_cast<unsigned int>(std::atoi(argv[++i]));
+    else if (arg == "--lora_qat")
+      lora_qat = true;
   }
 
   try {
@@ -80,7 +83,8 @@ int main(int argc, char *argv[]) {
     std::cout << "Model dir : " << model_dir << "\n";
     std::cout << "Train data: " << train_data_path << "\n";
     std::cout << "LR=" << lr << "  epochs=" << epochs
-              << "  patience=" << patience << "\n\n";
+              << "  patience=" << patience
+              << "  lora_qat=" << (lora_qat ? "true" : "false") << "\n\n";
 
     // Inject LoRA config into nntr_cfg (override JSON in memory)
     if (!nntr_cfg.contains("lora_rank") || nntr_cfg["lora_rank"] == 0) {
@@ -90,6 +94,8 @@ int main(int argc, char *argv[]) {
       nntr_cfg["lora_target"] =
         json::array({"wq", "wk", "wv", "wo", "ffn_up", "ffn_down", "ffn_gate"});
     }
+    if (lora_qat)
+      nntr_cfg["lora_qat"] = true;
     std::cout << "[LoRA] rank=" << nntr_cfg["lora_rank"]
               << "  alpha=" << nntr_cfg["lora_alpha"]
               << "  targets=" << nntr_cfg["lora_target"].dump() << "\n\n";
@@ -157,11 +163,13 @@ int main(int argc, char *argv[]) {
       unsigned int best_epoch   = 0;
       bool stop_flag            = false;
       std::string output_path;
+      bool lora_qat             = false;
     };
     CumStats cum{model.get()};
     cum.patience      = patience;
     cum.patience_left = patience;
     cum.output_path   = output_path;
+    cum.lora_qat      = lora_qat;
 
     auto epoch_cb = [](void *ud) {
       auto *c = static_cast<CumStats *>(ud);
@@ -175,6 +183,8 @@ int main(int argc, char *argv[]) {
       std::cout << "  Cumulative | AvgLoss: " << avg
                 << "  CumPPL: " << cum_ppl
                 << "  EpochPPL: " << ppl << "\n";
+      if (c->lora_qat)
+        c->mdl->printLoRAQATStats();
 
       // Early stopping: track best validation loss
       if (vs.loss < c->best_val_loss) {

@@ -16,7 +16,13 @@
 #ifdef __cplusplus
 
 #include <common_properties.h>
+#include <functional>
 #include <layer_impl.h>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <tensor.h>
+#include <unordered_map>
 
 namespace nntrainer {
 
@@ -33,8 +39,9 @@ public:
 
   /**
    * @brief     Destructor of Fully Connected Layer
+   * Prints final QAT calibration stats when lora_qat was active.
    */
-  ~FullyConnectedLayer() = default;
+  ~FullyConnectedLayer();
 
   /**
    *  @brief  Move constructor.
@@ -111,17 +118,57 @@ public:
 
   static constexpr const char *type = "fully_connected";
 
+  struct LoRAQATStats {
+    float a_min = 0, a_max = 0, a_scale = 0;
+    float b_min = 0, b_max = 0, b_scale = 0;
+    bool valid = false;
+  };
+  LoRAQATStats getLoRAQATStats() const;
+
+  /** Look up EMA stats for a layer by name (set during finalize). Thread-safe. */
+  static LoRAQATStats getRegisteredStats(const std::string &layer_name);
+
 private:
+  static std::mutex s_registry_mutex;
+  static std::unordered_map<std::string, LoRAQATStats> s_qat_registry;
+
   float lora_scaling;
-  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha>
+  float q_min;    /**< Q6_K lower bound: -32 (64 levels, 6-bit) */
+  float q_max;    /**< Q6_K upper bound:  31 */
+  float momentum; /**< EMA momentum for running min/max stats */
+  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha, props::LoraQAT>
     fc_props;                             /**< fc layer properties :
                                                 unit - number of output neurons,
                                                 lora_rank - rank of lora (optional)
-                                                lora_scaling - scaling factor of LoRA apply, i.e.,
-                                             lora_scaling = alpha / lora_rank */
+                                                lora_alpha - alpha for LoRA scaling
+                                                lora_qat - enable Q6_K fake-quant on LoRA adapters */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
+
+  bool qat_initialized_;    // true once finalize() sets up QAT EMA tensors
+  std::string layer_name_;  // name captured in finalize(), used to key s_qat_registry
+
+  // QAT: EMA running stats for loraA and loraB (scalar tensors, persist across batches)
+  Tensor lora_a_rmin, lora_a_rmax;
+  Tensor lora_b_rmin, lora_b_rmax;
+  // QAT: cached fake-quantized adapters from last forward (used in STE)
+  Tensor a_fq, b_fq;
+
+  /**
+   * @brief Fake-quantize x to Q6_K precision with EMA stats.
+   *        q_min_val/q_max_val control the quantization grid (use q_min/q_max members).
+   *        Training: updates EMA, quantizes with current-batch stats.
+   *        Inference: quantizes with EMA stats and snaps weights in-place (force-feed).
+   *        Backward is STE: gradient passes through unchanged.
+   */
+  Tensor fakeQuantize(const Tensor &x, Tensor &rmin, Tensor &rmax,
+                      float q_min_val, float q_max_val, bool training);
+
+  /**
+   * @brief Print QAT calibration stats (EMA min/max and derived scale) for debugging.
+   */
+  void printQATStats() const;
 };
 } // namespace nntrainer
 

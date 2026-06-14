@@ -162,6 +162,13 @@ public:
   virtual void exportWeightsToFile(const std::string &path);
 
   /**
+   * @brief Print per-epoch QAT calibration stats for the first transformer block's
+   *        LoRA adapters (wq, wk, wv, wo, ffn_up, ffn_gate, ffn_down).
+   *        No-op when LORA_QAT is false or LoRA not active.
+   */
+  virtual void printLoRAQATStats() const;
+
+  /**
    * @brief Save the weight to a file with type conversion
    * @param weight_path Path to save the weight file
    * @param dtype Global target data type for all layers (NONE = keep original)
@@ -276,6 +283,7 @@ protected:
 
   unsigned int LORA_RANK = 0;  /**< LoRA rank (0 = disabled) */
   unsigned int LORA_ALPHA = 0; /**< LoRA alpha (0 = use scaling=1) */
+  bool LORA_QAT = false;       /**< enable Q6_K fake-quant on LoRA adapters */
   std::vector<std::string> LORA_TARGET; /**< module names to apply LoRA to,
                                             e.g. {"q_proj","v_proj"} */
 

@@ -24,6 +24,7 @@
 #include <transformer.h>
 
 #include <embedding_layer.h>
+#include <fc_layer.h>
 #include <mha_core.h>
 #include <rms_norm.h>
 #include <swiglu.h>
@@ -143,6 +144,7 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   LORA_ALPHA = nntr_cfg.contains("lora_alpha")
                  ? nntr_cfg["lora_alpha"].get<unsigned int>()
                  : 0;
+  LORA_QAT = nntr_cfg.contains("lora_qat") && nntr_cfg["lora_qat"].get<bool>();
   LORA_TARGET =
     nntr_cfg.contains("lora_target")
       ? nntr_cfg["lora_target"].get<std::vector<std::string>>()
@@ -162,6 +164,8 @@ void Transformer::appendLoRAProps(std::vector<std::string> &props) const {
   props.push_back(withKey("lora_rank", LORA_RANK));
   if (LORA_ALPHA > 0)
     props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  if (LORA_QAT)
+    props.push_back(withKey("lora_qat", std::string("true")));
 }
 
 void Transformer::initialize() {
@@ -444,6 +448,14 @@ void Transformer::save_weight_lora(const std::string &weight_path) {
   if (!is_initialized)
     throw std::runtime_error("Model not initialized before save_weight_lora().");
 
+  // If QAT was active, do one inference forward on a dummy input to trigger
+  // the snap of loraA/loraB to the EMA-calibrated Q6_K grid before saving.
+  // We removed force-feed from the training loop to avoid corrupting Adam state,
+  // so we do it here — once, at the moment we actually need it.
+  // NOTE: currently we skip the snap here and save raw FP32 LoRA weights.
+  // nntr_quantize will apply Q6_K to them at quantization time; the EMA stats
+  // stored in lora_a_rmin/rmax are used as the calibrated scale hint.
+
   std::ofstream f(weight_path, std::ios::binary);
   if (!f.is_open())
     throw std::runtime_error("Failed to open " + weight_path + " for writing.");
@@ -557,6 +569,29 @@ void Transformer::summarize(std::ostream &out, unsigned int type) {
   if (!is_initialized)
     throw std::runtime_error("Model not initialized before summarize().");
   model->summarize(out, static_cast<ml_train_summary_type_e>(type));
+}
+
+void Transformer::printLoRAQATStats() const {
+  if (!LORA_QAT || LORA_RANK == 0 || !is_initialized)
+    return;
+
+  static const char *suffixes[] = {
+    "_wq", "_wk", "_wv", "_attention_out", "_ffn_up", "_ffn_gate", "_ffn_down"
+  };
+  std::string prefix = "layer0";
+
+  std::cout << "  [QAT] LoRA EMA stats (layer 0):\n";
+  for (const char *suf : suffixes) {
+    std::string lname = prefix + suf;
+    auto s = nntrainer::FullyConnectedLayer::getRegisteredStats(lname);
+    if (!s.valid)
+      continue;
+    std::cout << "    " << lname
+              << "  A:[" << s.a_min << ", " << s.a_max << "] scale=" << s.a_scale
+              << "  B:[" << s.b_min << ", " << s.b_max << "] scale=" << s.b_scale
+              << "\n";
+  }
+  std::cout << std::flush;
 }
 
 void Transformer::exportWeightsToFile(const std::string &path) {

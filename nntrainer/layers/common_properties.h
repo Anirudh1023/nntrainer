@@ -1512,6 +1512,15 @@ public:
 };
 
 /**
+ * @brief Enable QAT (fake Q6_K quantization) on LoRA adapters
+ */
+class LoraQAT : public Property<bool> {
+public:
+  static constexpr const char *key = "lora_qat"; /**< unique key to access */
+  using prop_tag = bool_prop_tag;                 /**< property type */
+};
+
+/**
  * @brief properties for getting the clipping value to clip the gradient by norm
  *
  */
