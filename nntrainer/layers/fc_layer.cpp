@@ -413,13 +413,14 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+  Tensor loraA, loraB;
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);
     loraB = context.getWeight(lora_idx[LORAParams::loraB]);
-    hidden_tmp_lora = context.getTensor(lora_idx[LORAParams::loraTmp]);
-    hidden_out_lora = context.getTensor(lora_idx[LORAParams::loraOut]);
+    // loraTmp/loraOut are NOT fetched from context here: they use
+    // FORWARD_GRAD_LIFESPAN which may not be allocated in inference mode.
+    // Instead, local tensors are allocated per batch step below.
   }
 
   TensorDim input_dim = input_.getDim();
@@ -445,24 +446,12 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     input_step.dot(weight, hidden_step, false, false);
 
     if (!std::get<props::LoraRank>(fc_props).empty()) {
-      nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
-      hidden_tmp_lora_step_dim.batch(1);
-      if (hidden_tmp_lora_step_dim.height() > 1)
-        hidden_tmp_lora_step_dim.height(to - from);
-
-      nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora.getDim();
-      hidden_out_lora_step_dim.batch(1);
-      if (hidden_out_lora_step_dim.height() > 1)
-        hidden_out_lora_step_dim.height(to - from);
-
-      nntrainer::Tensor hidden_tmp_lora_step =
-        hidden_tmp_lora.getSharedDataTensor(
-          hidden_tmp_lora_step_dim,
-          b * hidden_tmp_lora.height() * hidden_tmp_lora.width(), true);
-      nntrainer::Tensor hidden_out_lora_step =
-        hidden_out_lora.getSharedDataTensor(
-          hidden_out_lora_step_dim,
-          b * hidden_out_lora.height() * hidden_out_lora.width(), true);
+      // Allocate local intermediates — avoids context.getTensor which may fail
+      // in inference mode (FORWARD_GRAD_LIFESPAN not allocated without backward).
+      TensorDim tmp_step_dim = input_step_dim;
+      tmp_step_dim.width(loraA.getDim().width()); // lora_rank
+      nntrainer::Tensor hidden_tmp_lora_step(tmp_step_dim);
+      nntrainer::Tensor hidden_out_lora_step(hidden_step_dim);
 
       input_step.dot(loraA, hidden_tmp_lora_step, false, false);
       hidden_tmp_lora_step.dot(loraB, hidden_out_lora_step, false, false);
