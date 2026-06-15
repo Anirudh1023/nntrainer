@@ -274,7 +274,13 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     model->initialize();
-    model->load_weight(weight_file);
+    if (nntr_cfg.contains("lora_file_name")) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_file_name"].get<std::string>();
+      model->load_weight_lora(weight_file, lora_file);
+    } else {
+      model->load_weight(weight_file);
+    }
 
     bool do_sample = generation_cfg.value("do_sample", false);
 
