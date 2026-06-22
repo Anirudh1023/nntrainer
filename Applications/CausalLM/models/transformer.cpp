@@ -11,11 +11,13 @@
  */
 
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <unordered_set>
 
 #include <app_context.h>
+#include <cpu_backend.h>
 #include <engine.h>
 #include <model.h>
 
@@ -145,6 +147,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                  ? nntr_cfg["lora_alpha"].get<unsigned int>()
                  : 0;
   LORA_QAT = nntr_cfg.contains("lora_qat") && nntr_cfg["lora_qat"].get<bool>();
+  LORA_Q4  = nntr_cfg.contains("lora_weight_q4") &&
+             nntr_cfg["lora_weight_q4"].get<bool>();
   LORA_TARGET =
     nntr_cfg.contains("lora_target")
       ? nntr_cfg["lora_target"].get<std::vector<std::string>>()
@@ -166,6 +170,8 @@ void Transformer::appendLoRAProps(std::vector<std::string> &props) const {
     props.push_back(withKey("lora_alpha", LORA_ALPHA));
   if (LORA_QAT)
     props.push_back(withKey("lora_qat", std::string("true")));
+  if (LORA_Q4)
+    props.push_back(withKey("lora_weight_q4", std::string("true")));
 }
 
 void Transformer::initialize() {
@@ -531,6 +537,378 @@ void Transformer::load_weight_lora(const std::string &base_path,
   }
 
   std::cout << "[load_weight_lora] Loaded LoRA adapters from " << lora_path << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Q6_K helpers (self-contained, no extra headers needed)
+// ---------------------------------------------------------------------------
+
+struct q6k_block_t {
+  uint8_t ql[128];   // lower 4 bits of 256 quants
+  uint8_t qh[64];    // upper 2 bits of 256 quants
+  int8_t  scales[16]; // sub-block scales
+  uint16_t d;         // super-block scale (FP16)
+};
+static_assert(sizeof(q6k_block_t) == 210, "Q6_K block must be 210 bytes");
+
+static uint16_t q6k_fp32_to_fp16(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, sizeof(x));
+  uint16_t sign = (x >> 31) & 1;
+  int exp = (int)((x >> 23) & 0xFF) - 127;
+  uint32_t mant = x & 0x7FFFFF;
+  if (exp == 128) return (uint16_t)(sign << 15) | (mant ? 0x7E00 : 0x7C00);
+  if (exp > 15)   return (uint16_t)(sign << 15) | 0x7C00;
+  if (exp < -14)  return (uint16_t)(sign << 15);
+  return (uint16_t)((sign << 15) | ((exp + 15) << 10) | (mant >> 13));
+}
+
+static float q6k_fp16_to_fp32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 1;
+  uint32_t exp  = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+  uint32_t x;
+  if (exp == 0x1F) {
+    x = (sign << 31) | 0x7F800000 | (mant << 13);
+  } else if (exp == 0) {
+    x = sign << 31; // flush denormals to zero
+  } else {
+    x = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &x, sizeof(f));
+  return f;
+}
+
+// Encode FP32 data into Q6_K blocks using forced global scale from QAT EMA.
+// d = fp32_to_fp16(max(|ema_min|,|ema_max|) / 31), scales[i]=1 for all sub-blocks.
+static std::vector<uint8_t> build_q6k_forced(
+    const float *data, size_t N, float ema_min, float ema_max)
+{
+  constexpr size_t QK = 256;
+  float amax = std::max(std::abs(ema_min), std::abs(ema_max));
+  if (amax < 1e-10f) amax = 1e-10f;
+  float forced_d_f32 = amax / 31.0f;
+  uint16_t forced_d  = q6k_fp32_to_fp16(forced_d_f32);
+
+  size_t n_blocks = (N + QK - 1) / QK;
+  std::vector<uint8_t> out(n_blocks * sizeof(q6k_block_t), 0);
+  auto *blocks = reinterpret_cast<q6k_block_t *>(out.data());
+
+  uint8_t L[QK];
+  for (size_t b = 0; b < n_blocks; ++b) {
+    auto &blk = blocks[b];
+    blk.d = forced_d;
+    for (int s = 0; s < 16; ++s) blk.scales[s] = 1;
+
+    const float *x   = data + b * QK;
+    size_t remaining = std::min(QK, N - b * QK);
+
+    for (size_t j = 0; j < QK; ++j) {
+      float v = (j < remaining) ? x[j] : 0.0f;
+      int   q = (int)std::round(v / forced_d_f32);
+      q = std::max(-32, std::min(31, q));
+      L[j] = (uint8_t)(q + 32); // unsigned [0, 63]
+    }
+
+    // Pack ql/qh — mirrors quantize_row_q6_K_impl encoding
+    uint8_t *ql = blk.ql;
+    uint8_t *qh = blk.qh;
+    for (size_t j = 0; j < QK; j += 128) {
+      for (int l = 0; l < 32; ++l) {
+        uint8_t q1 = L[j + l +  0] & 0xF;
+        uint8_t q2 = L[j + l + 32] & 0xF;
+        uint8_t q3 = L[j + l + 64] & 0xF;
+        uint8_t q4 = L[j + l + 96] & 0xF;
+        ql[l +  0] = q1 | (q3 << 4);
+        ql[l + 32] = q2 | (q4 << 4);
+        qh[l] = ((L[j + l +  0] >> 4) & 3)        |
+                (((L[j + l + 32] >> 4) & 3) << 2)  |
+                (((L[j + l + 64] >> 4) & 3) << 4)  |
+                (((L[j + l + 96] >> 4) & 3) << 6);
+      }
+      ql += 64;
+      qh += 32;
+    }
+  }
+  return out;
+}
+
+// Dequantize Q6_K block buffer back to FP32 — mirrors dequantize_row_q6_K_impl.
+static void dequantize_q6k(const void *buf, float *out, size_t N) {
+  constexpr size_t QK = 256;
+  size_t n_blocks = (N + QK - 1) / QK;
+  const auto *blocks = reinterpret_cast<const q6k_block_t *>(buf);
+
+  for (size_t b = 0; b < n_blocks; ++b) {
+    const auto &blk = blocks[b];
+    float d = q6k_fp16_to_fp32(blk.d);
+
+    const uint8_t *ql = blk.ql;
+    const uint8_t *qh = blk.qh;
+    const int8_t  *sc = blk.scales;
+    float *y = out + b * QK;
+
+    for (int n = 0; n < 2; ++n) { // two halves of 128 elements each
+      for (int l = 0; l < 32; ++l) {
+        int is = l / 16;
+        int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        int8_t q3 = (int8_t)(((ql[l +  0] >> 4)) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        int8_t q4 = (int8_t)(((ql[l + 32] >> 4)) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        size_t base = (size_t)(b * QK + n * 128);
+        if (base + l +  0 < N) y[n * 128 + l +  0] = d * sc[is + 0] * q1;
+        if (base + l + 32 < N) y[n * 128 + l + 32] = d * sc[is + 2] * q2;
+        if (base + l + 64 < N) y[n * 128 + l + 64] = d * sc[is + 4] * q3;
+        if (base + l + 96 < N) y[n * 128 + l + 96] = d * sc[is + 6] * q4;
+      }
+      ql += 64;
+      qh += 32;
+      sc += 8;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_0 helpers (block = 32 elements, 18 bytes: 2B FP16 scale + 16B nibbles)
+// ---------------------------------------------------------------------------
+
+// Encode FP32 data into Q4_0 blocks using forced global scale from QAT EMA.
+// d = amax/8  (positive),  quant = clamp(round(x/d), -8, 7) stored as q+8.
+// Layout: qs[j] lower nibble = elem[j], upper nibble = elem[j+16] for j in [0,16).
+// Build repacked Q4_0 bytes from FP32 weight stored in nntrainer (K, N) layout.
+// Mirrors the quantizer.cpp pipeline: transpose K×N→N×K, then quantize_q4_0,
+// then repack_q4_0. The repacked format is required by __ggml_q4_0_4x8_q8_0_GEMM.
+static std::vector<uint8_t> build_q4_0_natural(
+    const float *data_KN, size_t K, size_t N)
+{
+  // Transpose from nntrainer (K rows × N cols) to quantizer (N rows × K cols)
+  std::vector<float> transposed(N * K);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t k = 0; k < K; ++k)
+      transposed[n * K + k] = data_KN[k * N + n];
+
+  size_t out_size = (N * K / 32) * 18;  // 18 bytes per Q4_0 block of 32 elements
+  std::vector<uint8_t> tmp(out_size);
+  nntrainer::quantize_q4_0(transposed.data(), tmp.data(), (int64_t)N, (int64_t)K, nullptr);
+
+  std::vector<uint8_t> out(out_size);
+  nntrainer::repack_q4_0(out.data(), tmp.data(), out_size, (unsigned int)N, (unsigned int)K);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+
+void Transformer::save_weight_lora_q6k(const std::string &path) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before save_weight_lora_q6k().");
+  if (!LORA_QAT)
+    throw std::runtime_error("save_weight_lora_q6k() requires LORA_QAT=true (no EMA stats).");
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open " + path + " for writing.");
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+  size_t total_blocks = 0;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0) continue;
+    } catch (...) { continue; }
+
+    auto stats = nntrainer::FullyConnectedLayer::getRegisteredStats(lname);
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try { layer->getWeights(wdata, wdims); } catch (...) { continue; }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi]) continue;
+      if (!visited.insert(wdata[wi]).second) continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      bool is_loraA = wname.find(":loraA") != std::string::npos;
+      bool is_loraB = wname.find(":loraB") != std::string::npos;
+      if (!is_loraA && !is_loraB) continue;
+
+      if (!stats.valid)
+        throw std::runtime_error(
+          "No QAT EMA stats for layer '" + lname + "'. "
+          "Ensure at least one training forward pass ran with lora_qat=true.");
+
+      float ema_min = is_loraA ? stats.a_min : stats.b_min;
+      float ema_max = is_loraA ? stats.a_max : stats.b_max;
+
+      uint32_t N = static_cast<uint32_t>(wdims[wi].getDataLen());
+      auto q6k_bytes = build_q6k_forced(wdata[wi], N, ema_min, ema_max);
+
+      f.write(reinterpret_cast<const char *>(&N), sizeof(N));
+      f.write(reinterpret_cast<const char *>(q6k_bytes.data()), q6k_bytes.size());
+      total_blocks += q6k_bytes.size() / sizeof(q6k_block_t);
+    }
+  }
+
+  std::cout << "[save_weight_lora_q6k] Saved Q6_K LoRA adapters to " << path
+            << " (" << total_blocks << " blocks, "
+            << (total_blocks * 210 / 1024) << " KB)\n";
+}
+
+void Transformer::load_weight_lora_q6k(const std::string &base_path,
+                                        const std::string &lora_q6k_path) {
+  load_weight(base_path);
+
+  std::ifstream f(lora_q6k_path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open Q6_K LoRA file: " + lora_q6k_path);
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0) continue;
+    } catch (...) { continue; }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try { layer->getWeights(wdata, wdims); } catch (...) { continue; }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi]) continue;
+      if (!visited.insert(wdata[wi]).second) continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      if (wname.find(":loraA") == std::string::npos &&
+          wname.find(":loraB") == std::string::npos)
+        continue;
+
+      uint32_t N = 0;
+      f.read(reinterpret_cast<char *>(&N), sizeof(N));
+      if (!f)
+        throw std::runtime_error("load_weight_lora_q6k: failed reading element count at '" + wname + "'");
+
+      uint32_t expected = static_cast<uint32_t>(wdims[wi].getDataLen());
+      if (N != expected)
+        throw std::runtime_error(
+          "load_weight_lora_q6k: element count mismatch for '" + wname +
+          "': file=" + std::to_string(N) + " model=" + std::to_string(expected));
+
+      constexpr size_t QK = 256;
+      size_t n_blocks   = (N + QK - 1) / QK;
+      size_t block_bytes = n_blocks * sizeof(q6k_block_t);
+
+      std::vector<uint8_t> buf(block_bytes);
+      f.read(reinterpret_cast<char *>(buf.data()), block_bytes);
+      if (!f)
+        throw std::runtime_error("load_weight_lora_q6k: failed reading Q6_K data for '" + wname + "'");
+
+      dequantize_q6k(buf.data(), wdata[wi], N);
+    }
+  }
+
+  std::cout << "[load_weight_lora_q6k] Loaded Q6_K LoRA adapters from " << lora_q6k_path << "\n";
+}
+
+void Transformer::save_weight_lora_q4(const std::string &path) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before save_weight_lora_q4().");
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open " + path + " for writing.");
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+  size_t total_blocks = 0;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0) continue;
+    } catch (...) { continue; }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try { layer->getWeights(wdata, wdims); } catch (...) { continue; }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi]) continue;
+      if (!visited.insert(wdata[wi]).second) continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      if (wname.find(":loraA") == std::string::npos &&
+          wname.find(":loraB") == std::string::npos) continue;
+
+      uint32_t total_elems = static_cast<uint32_t>(wdims[wi].getDataLen());
+      size_t K_dim = wdims[wi].height();
+      size_t N_dim = wdims[wi].width();
+      auto q4_bytes = build_q4_0_natural(wdata[wi], K_dim, N_dim);
+
+      f.write(reinterpret_cast<const char *>(&total_elems), sizeof(total_elems));
+      f.write(reinterpret_cast<const char *>(q4_bytes.data()), q4_bytes.size());
+      total_blocks += q4_bytes.size() / 18;
+    }
+  }
+
+  std::cout << "[save_weight_lora_q4] Saved Q4_0 LoRA adapters to " << path
+            << " (" << total_blocks << " blocks, "
+            << (total_blocks * 18 / 1024) << " KB)\n";
+}
+
+void Transformer::load_weight_lora_q4(const std::string &base_path,
+                                       const std::string &lora_q4_path) {
+  load_weight(base_path);
+
+  std::ifstream f(lora_q4_path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open Q4_0 LoRA file: " + lora_q4_path);
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0) continue;
+    } catch (...) { continue; }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try { layer->getWeights(wdata, wdims); } catch (...) { continue; }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi]) continue;
+      if (!visited.insert(wdata[wi]).second) continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      if (wname.find(":loraA") == std::string::npos &&
+          wname.find(":loraB") == std::string::npos)
+        continue;
+
+      uint32_t N = 0;
+      f.read(reinterpret_cast<char *>(&N), sizeof(N));
+      if (!f)
+        throw std::runtime_error("load_weight_lora_q4: failed reading element count at '" + wname + "'");
+
+      uint32_t expected = static_cast<uint32_t>(wdims[wi].getDataLen());
+      if (N != expected)
+        throw std::runtime_error(
+          "load_weight_lora_q4: element count mismatch for '" + wname +
+          "': file=" + std::to_string(N) + " model=" + std::to_string(expected));
+
+      // Write repacked Q4_0 bytes directly into the Q4_0 tensor buffer.
+      size_t block_bytes = (N / 32) * 18;
+      f.read(reinterpret_cast<char *>(wdata[wi]), block_bytes);
+      if (!f)
+        throw std::runtime_error("load_weight_lora_q4: failed reading Q4_0 data for '" + wname + "'");
+    }
+  }
+
+  std::cout << "[load_weight_lora_q4] Loaded Q4_0 LoRA adapters from " << lora_q4_path << "\n";
 }
 
 void Transformer::setDataset(const ml::train::DatasetModeType &mode,

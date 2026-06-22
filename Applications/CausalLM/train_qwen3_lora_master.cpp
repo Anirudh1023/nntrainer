@@ -8,6 +8,8 @@
  *       [--lr <float>] [--epochs <int>]
  *       [--output <path>] [--lora_path <path>]
  *       [--max_samples <int>] [--skip_weights]
+ *       [--lora_qat]   enable Q6_K fake-quant QAT (saves .q6k.bin)
+ *       [--lora_q4]    enable Q4_0 fake-quant QAT (saves .q4.bin); rank defaults to 32
  */
 
 #include <chrono>
@@ -35,7 +37,8 @@ int main(int argc, char *argv[]) {
               << " <model_dir> <train_data.txt>"
                  " [--lr <float>] [--epochs <int>]"
                  " [--output <path>] [--lora_path <path>]"
-                 " [--max_samples <int>] [--skip_weights]\n";
+                 " [--max_samples <int>] [--skip_weights]"
+                 " [--lora_qat] [--lora_q4]\n";
     return 1;
   }
 
@@ -49,6 +52,7 @@ int main(int argc, char *argv[]) {
   bool skip_weights = false;
   unsigned int patience = 5;
   bool lora_qat = false;
+  bool lora_q4  = false;  // Q4_0 LoRA: implies lora_qat, uses Q4_0 fake-quant range
 
   for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
@@ -68,6 +72,8 @@ int main(int argc, char *argv[]) {
       patience = static_cast<unsigned int>(std::atoi(argv[++i]));
     else if (arg == "--lora_qat")
       lora_qat = true;
+    else if (arg == "--lora_q4")
+      lora_q4 = true;  // save as Q4_0 PTQ at each checkpoint; no QAT needed
   }
 
   try {
@@ -84,7 +90,8 @@ int main(int argc, char *argv[]) {
     std::cout << "Train data: " << train_data_path << "\n";
     std::cout << "LR=" << lr << "  epochs=" << epochs
               << "  patience=" << patience
-              << "  lora_qat=" << (lora_qat ? "true" : "false") << "\n\n";
+              << "  lora_qat=" << (lora_qat ? "true" : "false")
+              << "  lora_q4=" << (lora_q4 ? "true" : "false") << "\n\n";
 
     // Inject LoRA config into nntr_cfg (override JSON in memory)
     if (!nntr_cfg.contains("lora_rank") || nntr_cfg["lora_rank"] == 0) {
@@ -94,8 +101,18 @@ int main(int argc, char *argv[]) {
       nntr_cfg["lora_target"] =
         json::array({"wq", "wk", "wv", "wo", "ffn_up", "ffn_down", "ffn_gate"});
     }
+    // Q4_0 requires rank % 32 == 0; force rank=32 regardless of config.
+    if (lora_q4) {
+      nntr_cfg["lora_rank"]  = 32;
+      nntr_cfg["lora_alpha"] = 64;
+      if (!nntr_cfg.contains("lora_target") || nntr_cfg["lora_target"].empty())
+        nntr_cfg["lora_target"] =
+          json::array({"wq", "wk", "wv", "wo", "ffn_up", "ffn_down", "ffn_gate"});
+      std::cout << "[LoRA] Q4_0 mode: forcing rank=32, alpha=64.\n";
+    }
     if (lora_qat)
       nntr_cfg["lora_qat"] = true;
+    // lora_weight_q4 is inference-only; do not inject during training.
     std::cout << "[LoRA] rank=" << nntr_cfg["lora_rank"]
               << "  alpha=" << nntr_cfg["lora_alpha"]
               << "  targets=" << nntr_cfg["lora_target"].dump() << "\n\n";
@@ -164,12 +181,14 @@ int main(int argc, char *argv[]) {
       bool stop_flag            = false;
       std::string output_path;
       bool lora_qat             = false;
+      bool lora_q4              = false;
     };
     CumStats cum{model.get()};
     cum.patience      = patience;
     cum.patience_left = patience;
     cum.output_path   = output_path;
     cum.lora_qat      = lora_qat;
+    cum.lora_q4       = lora_q4;
 
     auto epoch_cb = [](void *ud) {
       auto *c = static_cast<CumStats *>(ud);
@@ -191,7 +210,17 @@ int main(int argc, char *argv[]) {
         c->best_val_loss   = vs.loss;
         c->best_epoch      = c->epoch_count;
         c->patience_left   = c->patience;
+        // Always save FP32 weights; also save Q4_0 (PTQ) when --lora_q4.
         c->mdl->save_weight_lora(c->output_path);
+        if (c->lora_q4) {
+          std::string q4_path = c->output_path;
+          auto dot = q4_path.rfind('.');
+          if (dot != std::string::npos)
+            q4_path.insert(dot, ".q4");
+          else
+            q4_path += ".q4.bin";
+          c->mdl->save_weight_lora_q4(q4_path);
+        }
         std::cout << "  [Best] val_loss=" << vs.loss
                   << " at epoch " << c->epoch_count
                   << " -> checkpoint saved\n";

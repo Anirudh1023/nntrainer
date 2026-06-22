@@ -118,6 +118,34 @@ public:
                                 const std::string &lora_path);
 
   /**
+   * @brief Save LoRA adapters as Q6_K with force-fed scales from QAT EMA stats.
+   *        Only valid after QAT training (lora_qat=true).
+   *        File format per adapter: uint32_t N + ceil(N/256)*210 raw Q6_K bytes.
+   */
+  virtual void save_weight_lora_q6k(const std::string &path);
+
+  /**
+   * @brief Load base weights, then load Q6_K LoRA adapters and dequantize to FP32.
+   */
+  virtual void load_weight_lora_q6k(const std::string &base_path,
+                                     const std::string &lora_q6k_path);
+
+  /**
+   * @brief Save LoRA adapters as Q4_0 with force-fed scales from QAT EMA stats.
+   *        Only valid after QAT training with --lora_q4 (lora_qat + lora_weight_q4).
+   *        File format per adapter: uint32_t N + (N/32)*18 raw Q4_0 block bytes.
+   *        Requires lora_rank % 32 == 0 (rank=32 recommended).
+   */
+  virtual void save_weight_lora_q4(const std::string &path);
+
+  /**
+   * @brief Load base weights, then load Q4_0 LoRA adapters directly into Q4_0 tensors.
+   *        No dequantization — the W4A8 kernel fires at runtime.
+   */
+  virtual void load_weight_lora_q4(const std::string &base_path,
+                                    const std::string &lora_q4_path);
+
+  /**
    * @brief Set a dataset on the underlying nntrainer model.
    */
   virtual void
@@ -283,7 +311,8 @@ protected:
 
   unsigned int LORA_RANK = 0;  /**< LoRA rank (0 = disabled) */
   unsigned int LORA_ALPHA = 0; /**< LoRA alpha (0 = use scaling=1) */
-  bool LORA_QAT = false;       /**< enable Q6_K fake-quant on LoRA adapters */
+  bool LORA_QAT = false;       /**< enable fake-quant on LoRA adapters (QAT training) */
+  bool LORA_Q4  = false;       /**< Q4_0 LoRA: W4A8 inference + Q4_0 fake-quant range */
   std::vector<std::string> LORA_TARGET; /**< module names to apply LoRA to,
                                             e.g. {"q_proj","v_proj"} */
 

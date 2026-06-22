@@ -133,15 +133,17 @@ private:
   static std::unordered_map<std::string, LoRAQATStats> s_qat_registry;
 
   float lora_scaling;
-  float q_min;    /**< Q6_K lower bound: -32 (64 levels, 6-bit) */
-  float q_max;    /**< Q6_K upper bound:  31 */
+  float q_min;    /**< Q4_0 fake-quant lower bound: -8 */
+  float q_max;    /**< Q4_0 fake-quant upper bound:  7 */
   float momentum; /**< EMA momentum for running min/max stats */
-  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha, props::LoraQAT>
+  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha, props::LoraQAT,
+             props::LoraWeightQ4>
     fc_props;                             /**< fc layer properties :
                                                 unit - number of output neurons,
                                                 lora_rank - rank of lora (optional)
                                                 lora_alpha - alpha for LoRA scaling
-                                                lora_qat - enable Q6_K fake-quant on LoRA adapters */
+                                                lora_qat - enable fake-quant on LoRA adapters
+                                                lora_weight_q4 - Q4_0 tensors for inference / Q4_0 range for QAT */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;

@@ -52,10 +52,11 @@ std::unordered_map<std::string, FullyConnectedLayer::LoRAQATStats>
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  q_min(-32.0f),   // Q6_K: 64 levels in [-32, 31], NOT INT8 [-128, 127]
-  q_max(31.0f),
+  q_min(-8.0f),    // Q4_0: 16 levels in [-8, 7]
+  q_max(7.0f),
   momentum(0.1f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(), props::LoraQAT()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(), props::LoraQAT(),
+           props::LoraWeightQ4()),
   quantizer(nullptr),
   qat_initialized_(false) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
@@ -241,20 +242,28 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   /** create weights for LoRA */
   if (lora_rank) {
 
+    const bool lora_qat_mode = !std::get<props::LoraQAT>(fc_props).empty() &&
+                               std::get<props::LoraQAT>(fc_props).get();
+    const bool lora_q4       = !std::get<props::LoraWeightQ4>(fc_props).empty() &&
+                               std::get<props::LoraWeightQ4>(fc_props).get();
+    // Inference with Q4_0: use Q4_0 tensor dtype → W4A8 kernel fires at runtime.
+    // Training (QAT): keep FP32 for gradients; fake-quant range adjusted below.
+    const auto lora_dtype = (lora_q4 && !lora_qat_mode)
+                              ? TensorDim::DataType::Q4_0
+                              : TensorDim::DataType::FP32;
+
     /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
-    // LoRA adapters are always FP32 regardless of the base weight dtype
-    // (Q4_0/Q4_K etc. would reject rank=8 as width since 8 % 32 != 0)
     TensorDim loraA_dim(
       1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
       is_nchw ? lora_rank : in_dim.channel(),
-      TensorDim::TensorType(context.getFormat(), TensorDim::DataType::FP32),
+      TensorDim::TensorType(context.getFormat(), lora_dtype),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraB Dimension : (1, 1, lora_rank, unit) */
     TensorDim loraB_dim(
       1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
       is_nchw ? unit : lora_rank,
-      TensorDim::TensorType(context.getFormat(), TensorDim::DataType::FP32),
+      TensorDim::TensorType(context.getFormat(), lora_dtype),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
@@ -273,16 +282,25 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
                             context.getActivationDataType()),
       is_nchw ? 0b1011 : 0b1101);
 
-    // A=zeros, B=random: keeps zero LoRA contribution at init (0 @ random = 0)
-    // but b_fq is non-zero from batch 1, so A gets gradient via chain-rule STE
-    // immediately. Matches Pranjal's QAT design (qat_fc_layer.cpp).
+    // Q4_0 inference: NONE init (will be overwritten from file), not trainable.
+    // QAT + FP32 training: A=random, B=zeros — standard LoRA init (Hu et al. 2022).
+    // With A=zeros,B=random (old QAT init) loraB gets near-zero gradient since
+    // grad_loraB = output_grad * loraA^T ≈ 0, so loraB never learns.
+    const bool use_q4_tensors = lora_q4 && !lora_qat_mode;
+    const Initializer loraA_init = use_q4_tensors
+      ? Initializer::NONE : Initializer::LECUN_NORMAL;
+    const Initializer loraB_init = use_q4_tensors
+      ? Initializer::NONE : Initializer::ZEROS;
+
     lora_idx[LORAParams::loraA] = context.requestWeight(
-      loraA_dim, Initializer::ZEROS, weight_regularizer,
-      weight_regularizer_constant, weight_decay, "loraA", true);
+      loraA_dim, loraA_init,
+      weight_regularizer, weight_regularizer_constant, weight_decay,
+      "loraA", !use_q4_tensors);
 
     lora_idx[LORAParams::loraB] = context.requestWeight(
-      loraB_dim, Initializer::LECUN_NORMAL, weight_regularizer,
-      weight_regularizer_constant, weight_decay, "loraB", true);
+      loraB_dim, loraB_init,
+      weight_regularizer, weight_regularizer_constant, weight_decay,
+      "loraB", !use_q4_tensors);
 
     lora_idx[LORAParams::loraTmp] =
       context.requestTensor(loraTmp_dim, "hidden_tmp_lora", Initializer::NONE,
@@ -293,9 +311,7 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
 
     // Initialize QAT EMA running stats (scalar tensors, live in layer object)
-    const bool lora_qat = !std::get<props::LoraQAT>(fc_props).empty() &&
-                           std::get<props::LoraQAT>(fc_props).get();
-    if (lora_qat) {
+    if (lora_qat_mode) {
       lora_a_rmin = Tensor({1});
       lora_a_rmax = Tensor({1});
       lora_b_rmin = Tensor({1});
@@ -309,7 +325,7 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
       static int qat_layer_count = 0;
       if (++qat_layer_count == 1)
         std::cerr << "[QAT] LoRA QAT active: q_range=[" << q_min << ", "
-                  << q_max << "] (64 levels, Q6_K). "
+                  << q_max << "] (16 levels, Q4_0). "
                   << "Final EMA stats printed at exit.\n";
     }
   }
