@@ -553,47 +553,44 @@ User 206515 (selected for proof-of-concept):
 
 ## 12. Memory Breakdown
 
-> **Note:** The numbers below are derived analytically from model architecture
-> constants (rank=32, 28 layers, 7 targets, hidden=1024, inter=2816). The
-> `=== Memory Usage Summary ===` block printed at the end of each training run
-> provides the actual measured values. **Once the LAMP-3 training run completes,
-> replace the estimated totals in the tables below with the measured figures from
-> that run's output.**
+> **Note:** The numbers below combine analytical estimates (derived from model
+> architecture constants: rank=32, 28 layers, 7 targets, hidden=1024, inter=2816)
+> with **measured values from the completed LAMP-3 user 206515 training run**
+> (20 epochs, QAT+Q4_0, Qwen3-0.6B). The `=== Memory Usage Summary ===` block
+> printed at the end of each training run provides the snapshots and deltas.
 
-### Analytical LoRA Memory (rank=32, 28 layers, 7 targets)
+### LoRA Memory: Analytical vs Measured (rank=32, 28 layers, 7 targets)
 
-| Component               | Estimated | How computed                              |
-|-------------------------|-----------|-------------------------------------------|
-| LoRA weights (FP32)     | ~63 MB    | (loraA + loraB) × layers × 4 bytes        |
-| LoRA gradients          | ~63 MB    | same shape as weights, one grad tensor each|
-| Adam optimizer states   | ~126 MB   | 2 × weights (m and v per parameter)        |
-| QAT fq tensors          | ~63 MB    | a_fq + b_fq FP32 copies (QAT only)        |
-| **LoRA total (QAT)**    | ~315 MB   | weights + grads + Adam + fq                |
-| **LoRA total (no QAT)** | ~252 MB   | weights + grads + Adam                     |
+| Component               | Analytical estimate | Measured (LAMP-3 run) | How computed                              |
+|-------------------------|---------------------|-----------------------|-------------------------------------------|
+| LoRA weights (FP32)     | ~63 MB              | **66 MB**             | (loraA + loraB) × layers × 4 bytes        |
+| LoRA gradients          | ~63 MB              | **66 MB**             | same shape as weights, one grad tensor each|
+| Adam optimizer states   | ~126 MB             | **133 MB**            | 2 × weights (m and v per parameter)        |
+| QAT fq tensors          | ~63 MB              | **66 MB**             | a_fq + b_fq FP32 copies (QAT only)        |
+| **LoRA total (QAT)**    | ~315 MB             | **332 MB**            | weights + grads + Adam + fq                |
+| **LoRA total (no QAT)** | ~252 MB             | **265 MB**            | weights + grads + Adam                     |
 
-The `training_overhead` line in the measured summary = `peak - pre_train` and should
-roughly match `LoRA total + activation buffers`. QAT adds exactly one extra
-`lora_weight_kb` worth of memory for the fq tensors.
+The `peak - pre_train` delta (513 MB measured) equals LoRA total (332 MB) + activation/gradient buffers (~181 MB). QAT adds exactly one extra set of fq tensors (66 MB) vs non-QAT.
 
-### Total Training Memory (Qwen3-0.6B Q4_0) — Estimated
+### Total Training Memory (Qwen3-0.6B Q4_0) — Measured
 
-| Stage                         | Estimated | Measured (fill from run) |
-|-------------------------------|-----------|--------------------------|
-| Process baseline              | ~42 MB    |                          |
-| + Model graph (no weights)    | +340 MB   |                          |
-| + Base Q4_0 weights           | +730 MB   |                          |
-| + Pre-train ready             | —         |                          |
-| + Peak during training (QAT)  | +315 MB   |                          |
-| + Forward activation buffers  | +200 MB   |                          |
-| **Peak training total (QAT)** | ~1627 MB  |                          |
+| Stage                           | Measured          | Notes                                      |
+|---------------------------------|-------------------|--------------------------------------------|
+| Process baseline                | **12 MB**         | before any model allocation                |
+| After model graph init          | **1158 MB** (+1145 MB) | all tensors allocated, weights not loaded yet |
+| After base weights load         | **1159 MB** (+0 MB)    | Q4_0 weights embedded in graph at init     |
+| Pre-train ready                 | **1254 MB** (+95 MB)   | tokenizer, data loader, optimizer init     |
+| After epoch 1 (first backward)  | **1765 MB** (+511 MB)  | activations + all LoRA states materialized |
+| **Peak during training (QAT)**  | **1767 MB** (+513 MB above pre-train) | peak activation+grad+optimizer overhead |
+| After training done             | **1321 MB**       | optimizer states freed, activations freed  |
 
 ### Comparison: LoRA QAT vs Full Fine-Tuning (FP32)
 
-| Approach            | Weights   | Gradients | Optimizer | Total    |
-|---------------------|-----------|-----------|-----------|----------|
-| Full fine-tune FP32 | ~2400 MB  | ~2400 MB  | ~4800 MB  | ~9600 MB |
-| LoRA QAT (rank=32)  | ~730+63MB | ~63 MB    | ~126 MB   | ~1627 MB |
-| **Reduction**       |           |           |           | **~83%** |
+| Approach            | Weights        | Gradients | Optimizer  | Total       |
+|---------------------|----------------|-----------|------------|-------------|
+| Full fine-tune FP32 | ~2400 MB       | ~2400 MB  | ~4800 MB   | ~9600 MB    |
+| LoRA QAT (rank=32)  | ~730 + 66 MB   | 66 MB     | 133 MB     | **1767 MB** |
+| **Reduction**       |                |           |            | **~82%**    |
 
 ---
 
