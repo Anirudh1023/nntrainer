@@ -15,10 +15,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
 #include <vector>
+#include <sys/resource.h>
 
 #include <causal_lm.h>
 #include <dataset.h>
@@ -30,6 +32,30 @@
 #include "qwen3_causallm.h"
 
 using json = nlohmann::json;
+
+static size_t readVmRSS_KB() {
+  std::ifstream f("/proc/self/status");
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.rfind("VmRSS:", 0) == 0) {
+      size_t kb = 0;
+      sscanf(line.c_str(), "VmRSS: %zu kB", &kb);
+      return kb;
+    }
+  }
+  struct rusage u;
+  getrusage(RUSAGE_SELF, &u);
+#ifdef __APPLE__
+  return static_cast<size_t>(u.ru_maxrss) / 1024;
+#else
+  return static_cast<size_t>(u.ru_maxrss);
+#endif
+}
+
+static void printMemRow(const char *label, size_t kb) {
+  std::cout << "  [MEM] " << label << ": " << kb / 1024 << " MB  ("
+            << kb << " KB)\n";
+}
 
 int main(int argc, char *argv[]) {
   if (argc < 3) {
@@ -85,6 +111,8 @@ int main(int argc, char *argv[]) {
     auto gen_cfg  = causallm::LoadJsonFile(gen_config_path);
     auto nntr_cfg = causallm::LoadJsonFile(nntr_config_path);
 
+    size_t mem_baseline = readVmRSS_KB();
+
     std::cout << "=== Qwen3 LoRA Training ===\n";
     std::cout << "Model dir : " << model_dir << "\n";
     std::cout << "Train data: " << train_data_path << "\n";
@@ -119,6 +147,7 @@ int main(int argc, char *argv[]) {
 
     auto model = std::make_unique<causallm::Qwen3CausalLM>(cfg, gen_cfg, nntr_cfg);
     model->initializeForTraining(lr, epochs);
+    size_t mem_after_init = readVmRSS_KB();
 
     if (!skip_weights && nntr_cfg.contains("model_file_name")) {
       std::string weight_path =
@@ -133,6 +162,7 @@ int main(int argc, char *argv[]) {
     } else {
       std::cout << "Skipping weight load (random init).\n";
     }
+    size_t mem_after_weights = readVmRSS_KB();
 
     // Build tokenizer
     std::string tokenizer_path = model_dir + "/tokenizer.json";
@@ -182,6 +212,9 @@ int main(int argc, char *argv[]) {
       std::string output_path;
       bool lora_qat             = false;
       bool lora_q4              = false;
+      // memory tracking
+      size_t peak_train_mem_kb  = 0;
+      size_t mem_epoch1_kb      = 0;   // snapshot after first epoch ends
     };
     CumStats cum{model.get()};
     cum.patience      = patience;
@@ -193,6 +226,9 @@ int main(int argc, char *argv[]) {
     auto epoch_cb = [](void *ud) {
       auto *c = static_cast<CumStats *>(ud);
       c->epoch_count++;
+      size_t cur_mem = readVmRSS_KB();
+      if (cur_mem > c->peak_train_mem_kb) c->peak_train_mem_kb = cur_mem;
+      if (c->epoch_count == 1) c->mem_epoch1_kb = cur_mem;
       auto ts = c->mdl->getTrainingStats();
       auto vs = c->mdl->getValidStats();
       c->cumulative_loss += ts.loss;
@@ -201,7 +237,8 @@ int main(int argc, char *argv[]) {
       float cum_ppl = std::exp(avg);
       std::cout << "  Cumulative | AvgLoss: " << avg
                 << "  CumPPL: " << cum_ppl
-                << "  EpochPPL: " << ppl << "\n";
+                << "  EpochPPL: " << ppl
+                << "  Mem: " << cur_mem / 1024 << " MB\n";
       if (c->lora_qat)
         c->mdl->printLoRAQATStats();
 
@@ -237,17 +274,97 @@ int main(int argc, char *argv[]) {
       return static_cast<CumStats *>(ud)->stop_flag;
     };
 
+    size_t mem_pre_train = readVmRSS_KB();
     std::cout << "\n=== Starting training ===\n";
     auto t0 = std::chrono::steady_clock::now();
     model->train(epoch_cb, &cum, stop_cb, &cum);
     double elapsed =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
+    size_t mem_after_training = readVmRSS_KB();
+
     std::cout << "\nTraining done in " << elapsed << " s.\n";
     std::cout << "Best checkpoint: epoch " << cum.best_epoch
               << "  val_loss=" << cum.best_val_loss
               << "  val_PPL=" << std::exp(cum.best_val_loss) << "\n";
     std::cout << "LoRA weights saved to: " << output_path << "\n";
+
+    // --- Analytical LoRA weight size ---
+    // loraA(rank×K) + loraB(N×rank) in FP32 per layer per target
+    unsigned int lora_rank  = nntr_cfg["lora_rank"].get<unsigned int>();
+    unsigned int hidden     = cfg.value("hidden_size", 1024u);
+    unsigned int inter      = cfg.value("intermediate_size", 2816u);
+    unsigned int num_heads  = cfg.value("num_attention_heads", 16u);
+    unsigned int kv_heads   = cfg.value("num_key_value_heads", num_heads);
+    unsigned int num_layers = cfg.value("num_hidden_layers", 28u);
+    unsigned int head_dim   = hidden / num_heads;
+    unsigned int kv_dim     = kv_heads * head_dim;
+
+    // Elements per layer across all 7 LoRA targets
+    size_t elems_per_layer =
+      2 * lora_rank * hidden  +            // wq: A+B
+      lora_rank * hidden + kv_dim * lora_rank +  // wk
+      lora_rank * hidden + kv_dim * lora_rank +  // wv
+      2 * lora_rank * hidden  +            // wo
+      lora_rank * hidden + inter * lora_rank +   // ffn_up
+      lora_rank * hidden + inter * lora_rank +   // ffn_gate
+      inter * lora_rank + hidden * lora_rank;    // ffn_down (K=inter, N=hidden)
+    size_t lora_weight_kb = elems_per_layer * num_layers * sizeof(float) / 1024;
+    // QAT: a_fq + b_fq tensors = same size as LoRA weights
+    size_t qat_fq_kb      = lora_qat ? lora_weight_kb : 0;
+    // Gradients for loraA+loraB (same size as weights)
+    size_t lora_grad_kb   = lora_weight_kb;
+    // Adam optimizer: 2 moment vectors per param
+    size_t lora_optim_kb  = 2 * lora_weight_kb;
+
+    auto safeDelta = [](size_t a, size_t b) -> size_t {
+      return (a > b) ? (a - b) : 0;
+    };
+
+    size_t base_weights_kb  = safeDelta(mem_after_weights, mem_after_init);
+    size_t train_peak_delta = safeDelta(cum.peak_train_mem_kb, mem_pre_train);
+
+    std::cout << "\n=== Memory Usage Summary ===\n";
+    std::cout << "--- Snapshots ---\n";
+    printMemRow("Process baseline        ", mem_baseline);
+    printMemRow("After model graph init  ", mem_after_init);
+    printMemRow("After base weights load ", mem_after_weights);
+    printMemRow("Pre-train (ready)       ", mem_pre_train);
+    if (cum.mem_epoch1_kb)
+      printMemRow("After epoch 1           ", cum.mem_epoch1_kb);
+    printMemRow("Peak during training    ", cum.peak_train_mem_kb);
+    printMemRow("After training done     ", mem_after_training);
+
+    std::cout << "--- Deltas ---\n";
+    std::cout << "  [MEM] Model graph alloc      : "
+              << safeDelta(mem_after_init, mem_baseline) / 1024 << " MB"
+              << "  (init - baseline)\n";
+    std::cout << "  [MEM] Base model weights (Q4): "
+              << base_weights_kb / 1024 << " MB"
+              << "  (post-load - post-init)\n";
+    std::cout << "  [MEM] Forward+Backward peak  : "
+              << train_peak_delta / 1024 << " MB"
+              << "  (peak - pre-train; activations+grads+optimizer)\n";
+
+    std::cout << "--- Analytical LoRA breakdown (rank=" << lora_rank
+              << ", layers=" << num_layers << ") ---\n";
+    std::cout << "  [MEM] LoRA weights (FP32)    : "
+              << lora_weight_kb / 1024 << " MB"
+              << "  (loraA+loraB all layers)\n";
+    std::cout << "  [MEM] LoRA gradients         : "
+              << lora_grad_kb / 1024 << " MB"
+              << "  (dL/dA + dL/dB)\n";
+    std::cout << "  [MEM] Adam optimizer states  : "
+              << lora_optim_kb / 1024 << " MB"
+              << "  (m + v per param)\n";
+    if (lora_qat)
+      std::cout << "  [MEM] QAT fq tensors (a_fq+b_fq): "
+                << qat_fq_kb / 1024 << " MB"
+                << "  (FP32 fake-quant copies)\n";
+    std::cout << "  [MEM] LoRA total (weights+grad+optim"
+              << (lora_qat ? "+fq" : "") << "): "
+              << (lora_weight_kb + lora_grad_kb + lora_optim_kb + qat_fq_kb) / 1024
+              << " MB\n";
 
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << "\n";

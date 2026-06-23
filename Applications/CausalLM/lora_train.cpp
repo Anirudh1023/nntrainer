@@ -32,15 +32,47 @@ void TrainingDataGenerator::loadTextFile(const std::string &path) {
   if (!file.is_open())
     throw std::runtime_error("Failed to open training data file: " + path);
 
+  std::vector<std::string> all_lines;
   std::string line;
-  int count = 0;
-  while (std::getline(file, line)) {
-    if (line.empty())
-      continue;
-    auto ids = tokenizer_->Encode(line);
-    samples_.push_back(ids);
-    count++;
+  while (std::getline(file, line))
+    all_lines.push_back(line);
+
+  // Detect chat format: any line starts with <|im_start|>user
+  bool is_chat = false;
+  for (const auto &l : all_lines) {
+    if (l.rfind("<|im_start|>user", 0) == 0) {
+      is_chat = true;
+      break;
+    }
   }
+
+  int count = 0;
+  if (is_chat) {
+    // Each sample starts at a <|im_start|>user line and runs until the next
+    // one. Lines are joined with '\n' so the tokenizer sees the real newlines.
+    std::string current;
+    for (const auto &l : all_lines) {
+      if (l.rfind("<|im_start|>user", 0) == 0 && !current.empty()) {
+        auto ids = tokenizer_->Encode(current);
+        if (ids.size() >= 2) { samples_.push_back(ids); count++; }
+        current.clear();
+      }
+      if (!current.empty()) current += '\n';
+      current += l;
+    }
+    if (!current.empty()) {
+      auto ids = tokenizer_->Encode(current);
+      if (ids.size() >= 2) { samples_.push_back(ids); count++; }
+    }
+  } else {
+    for (const auto &l : all_lines) {
+      if (l.empty()) continue;
+      auto ids = tokenizer_->Encode(l);
+      samples_.push_back(ids);
+      count++;
+    }
+  }
+
   std::cout << "[TrainingData] Loaded " << path << " — " << count
             << " samples." << std::endl;
 }
