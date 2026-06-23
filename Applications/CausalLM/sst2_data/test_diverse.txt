@@ -1,0 +1,10 @@
+Question: What is the capital of France? Answer: Paris
+Question: What is 2 plus 2? Answer: four
+Question: What color is the sky on a clear day? Answer: blue
+Question: Who wrote Romeo and Juliet? Answer: Shakespeare
+Question: How many sides does a triangle have? Answer: three
+Question: What is the largest planet in our solar system? Answer: Jupiter
+Question: What do bees produce? Answer: honey
+Question: How many continents are there? Answer: seven
+Question: What gas do plants absorb from the air? Answer: carbon
+Question: What is the fastest land animal? Answer: cheetah

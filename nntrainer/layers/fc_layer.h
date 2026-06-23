@@ -23,6 +23,7 @@
 #include <string>
 #include <tensor.h>
 #include <unordered_map>
+#include <vector>
 
 namespace nntrainer {
 
@@ -123,54 +124,55 @@ public:
     float b_min = 0, b_max = 0, b_scale = 0;
     bool valid = false;
   };
-  LoRAQATStats getLoRAQATStats() const;
 
-  /** Look up EMA stats for a layer by name (set during finalize). Thread-safe. */
+  /** Look up per-block stats for a layer by name (updated each forward). Thread-safe. */
   static LoRAQATStats getRegisteredStats(const std::string &layer_name);
+
+  /**
+   * Look up per-block EMA scales (N×K layout) for a layer. Returns empty vectors
+   * if the layer hasn't run a QAT forward pass yet. Thread-safe.
+   */
+  static std::pair<std::vector<float>, std::vector<float>>
+  getRegisteredBlockScales(const std::string &layer_name);
 
 private:
   static std::mutex s_registry_mutex;
   static std::unordered_map<std::string, LoRAQATStats> s_qat_registry;
+  static std::unordered_map<std::string,
+    std::pair<std::vector<float>, std::vector<float>>> s_block_d_registry;
 
   float lora_scaling;
-  float q_min;    /**< Q4_0 fake-quant lower bound: -8 */
-  float q_max;    /**< Q4_0 fake-quant upper bound:  7 */
-  float momentum; /**< EMA momentum for running min/max stats */
   std::tuple<props::Unit, props::LoraRank, props::LoraAlpha, props::LoraQAT,
              props::LoraWeightQ4>
     fc_props;                             /**< fc layer properties :
                                                 unit - number of output neurons,
                                                 lora_rank - rank of lora (optional)
                                                 lora_alpha - alpha for LoRA scaling
-                                                lora_qat - enable fake-quant on LoRA adapters
-                                                lora_weight_q4 - Q4_0 tensors for inference / Q4_0 range for QAT */
+                                                lora_qat - enable per-block Q4_0 fake-quant
+                                                lora_weight_q4 - Q4_0 tensors for inference */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
 
-  bool qat_initialized_;    // true once finalize() sets up QAT EMA tensors
-  std::string layer_name_;  // name captured in finalize(), used to key s_qat_registry
+  float momentum; /**< EMA momentum for per-block scale update */
+  std::string layer_name_; // captured in finalize(), keys s_qat_registry
 
-  // QAT: EMA running stats for loraA and loraB (scalar tensors, persist across batches)
-  Tensor lora_a_rmin, lora_a_rmax;
-  Tensor lora_b_rmin, lora_b_rmax;
-  // QAT: cached fake-quantized adapters from last forward (used in STE)
+  // QAT: per-block EMA scales for loraA and loraB (one float per 32-elem block).
+  // Lazy-initialized on first forward pass when tensor sizes are known.
+  std::vector<float> lora_a_block_d;
+  std::vector<float> lora_b_block_d;
+
+  // QAT: cached fake-quantized adapters from last forward pass (used in STE backward)
   Tensor a_fq, b_fq;
 
   /**
-   * @brief Fake-quantize x to Q6_K precision with EMA stats.
-   *        q_min_val/q_max_val control the quantization grid (use q_min/q_max members).
-   *        Training: updates EMA, quantizes with current-batch stats.
-   *        Inference: quantizes with EMA stats and snaps weights in-place (force-feed).
+   * @brief Per-block Q4_0 fake-quantization with EMA block scales.
+   *        Training: updates EMA for each block, quantizes with EMA scale.
+   *        Validation: uses current EMA scales without updating them.
    *        Backward is STE: gradient passes through unchanged.
    */
-  Tensor fakeQuantize(const Tensor &x, Tensor &rmin, Tensor &rmax,
-                      float q_min_val, float q_max_val, bool training);
-
-  /**
-   * @brief Print QAT calibration stats (EMA min/max and derived scale) for debugging.
-   */
-  void printQATStats() const;
+  Tensor fakeQuantizeQ4_0(const Tensor &x, std::vector<float> &block_d,
+                          bool training);
 };
 } // namespace nntrainer
 

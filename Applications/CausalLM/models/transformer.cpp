@@ -673,27 +673,75 @@ static void dequantize_q6k(const void *buf, float *out, size_t N) {
 // Q4_0 helpers (block = 32 elements, 18 bytes: 2B FP16 scale + 16B nibbles)
 // ---------------------------------------------------------------------------
 
-// Encode FP32 data into Q4_0 blocks using forced global scale from QAT EMA.
-// d = amax/8  (positive),  quant = clamp(round(x/d), -8, 7) stored as q+8.
-// Layout: qs[j] lower nibble = elem[j], upper nibble = elem[j+16] for j in [0,16).
 // Build repacked Q4_0 bytes from FP32 weight stored in nntrainer (K, N) layout.
 // Mirrors the quantizer.cpp pipeline: transpose K×N→N×K, then quantize_q4_0,
 // then repack_q4_0. The repacked format is required by __ggml_q4_0_4x8_q8_0_GEMM.
 static std::vector<uint8_t> build_q4_0_natural(
     const float *data_KN, size_t K, size_t N)
 {
-  // Transpose from nntrainer (K rows × N cols) to quantizer (N rows × K cols)
   std::vector<float> transposed(N * K);
   for (size_t n = 0; n < N; ++n)
     for (size_t k = 0; k < K; ++k)
       transposed[n * K + k] = data_KN[k * N + n];
 
-  size_t out_size = (N * K / 32) * 18;  // 18 bytes per Q4_0 block of 32 elements
+  size_t out_size = (N * K / 32) * 18;
   std::vector<uint8_t> tmp(out_size);
   nntrainer::quantize_q4_0(transposed.data(), tmp.data(), (int64_t)N, (int64_t)K, nullptr);
 
   std::vector<uint8_t> out(out_size);
   nntrainer::repack_q4_0(out.data(), tmp.data(), out_size, (unsigned int)N, (unsigned int)K);
+  return out;
+}
+
+// Minimal FP32→FP16 for writing Q4_0 block scale fields.
+static uint16_t q40_fp32_to_fp16(float v) {
+  union { float f; uint32_t u; } x{v};
+  const uint32_t s = (x.u >> 16) & 0x8000u;
+  const int      e = ((x.u >> 23) & 0xFFu) - 127 + 15;
+  const uint32_t m = x.u & 0x7FFFFFu;
+  if (e <= 0) return (uint16_t)s;
+  if (e >= 31) return (uint16_t)(s | 0x7C00u);
+  return (uint16_t)(s | ((uint32_t)e << 10) | (m >> 13));
+}
+
+// Build repacked Q4_0 bytes using pre-specified per-block EMA scales (force-feed).
+// block_d_NK must be indexed in N×K layout — the same layout tracked by
+// fakeQuantizeQ4_0. Matches build_q4_0_natural's output format exactly so the
+// repacked bytes can be loaded and run through gemm_q4_0 unchanged.
+static std::vector<uint8_t> build_q4_0_forced_blocks(
+    const float *data_KN, size_t K, size_t N,
+    const std::vector<float> &block_d_NK)
+{
+  std::vector<float> transposed(N * K);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t k = 0; k < K; ++k)
+      transposed[n * K + k] = data_KN[k * N + n];
+
+  const size_t num_blocks = N * K / 32;
+  const size_t out_size   = num_blocks * 18;
+  std::vector<uint8_t> tmp(out_size, 0);
+
+  for (size_t b = 0; b < num_blocks; ++b) {
+    const float *blk_data = transposed.data() + b * 32;
+    float d = (b < block_d_NK.size() && block_d_NK[b] > 1e-10f)
+              ? block_d_NK[b] : 1.0f;
+
+    uint16_t d_fp16 = q40_fp32_to_fp16(d);
+    uint8_t *blk = tmp.data() + b * 18;
+    std::memcpy(blk, &d_fp16, 2);
+
+    // Q4_0: quant stored as q+8 ∈ [0,15]; lower nibble = elem[j], upper = elem[j+16]
+    for (int j = 0; j < 16; ++j) {
+      int q0 = (int)std::round(blk_data[j]      / d) + 8;
+      int q1 = (int)std::round(blk_data[j + 16] / d) + 8;
+      q0 = std::max(0, std::min(15, q0));
+      q1 = std::max(0, std::min(15, q1));
+      blk[2 + j] = (uint8_t)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+  }
+
+  std::vector<uint8_t> out(out_size);
+  nntrainer::repack_q4_0(out.data(), tmp.data(), out_size, (unsigned)N, (unsigned)K);
   return out;
 }
 
@@ -846,7 +894,21 @@ void Transformer::save_weight_lora_q4(const std::string &path) {
       uint32_t total_elems = static_cast<uint32_t>(wdims[wi].getDataLen());
       size_t K_dim = wdims[wi].height();
       size_t N_dim = wdims[wi].width();
-      auto q4_bytes = build_q4_0_natural(wdata[wi], K_dim, N_dim);
+
+      // QAT: force-feed EMA block scales (N×K layout) tracked during training.
+      // Non-QAT: use GGML natural per-block scales.
+      std::vector<uint8_t> q4_bytes;
+      if (LORA_QAT) {
+        auto [a_bd, b_bd] = nntrainer::FullyConnectedLayer::getRegisteredBlockScales(lname);
+        const bool is_loraA = (wname.find(":loraA") != std::string::npos);
+        const auto &block_d = is_loraA ? a_bd : b_bd;
+        if (!block_d.empty())
+          q4_bytes = build_q4_0_forced_blocks(wdata[wi], K_dim, N_dim, block_d);
+        else
+          q4_bytes = build_q4_0_natural(wdata[wi], K_dim, N_dim);
+      } else {
+        q4_bytes = build_q4_0_natural(wdata[wi], K_dim, N_dim);
+      }
 
       f.write(reinterpret_cast<const char *>(&total_elems), sizeof(total_elems));
       f.write(reinterpret_cast<const char *>(q4_bytes.data()), q4_bytes.size());

@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <unordered_map>
 
 #include <common_properties.h>
@@ -44,116 +45,86 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum FCParams { weight, bias };
 enum LORAParams { loraA, loraB, loraTmp, loraOut };
 
-// Static registry: layer_name → QAT stats, updated every forward pass.
+// Static registries: layer_name → QAT stats / per-block EMA scales.
 std::mutex FullyConnectedLayer::s_registry_mutex;
 std::unordered_map<std::string, FullyConnectedLayer::LoRAQATStats>
   FullyConnectedLayer::s_qat_registry;
+std::unordered_map<std::string,
+  std::pair<std::vector<float>, std::vector<float>>>
+  FullyConnectedLayer::s_block_d_registry;
 
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  q_min(-8.0f),    // Q4_0: 16 levels in [-8, 7]
-  q_max(7.0f),
-  momentum(0.1f),
   fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(), props::LoraQAT(),
            props::LoraWeightQ4()),
   quantizer(nullptr),
-  qat_initialized_(false) {
+  momentum(0.1f) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
-FullyConnectedLayer::~FullyConnectedLayer() {
-  if (qat_initialized_)
-    printQATStats();
-}
+FullyConnectedLayer::~FullyConnectedLayer() = default;
 
-// Fake-quantize x to the [q_min_val, q_max_val] grid using EMA running stats.
-// Matches Pranjal's qat_fc_layer.cpp design: parameterized range + momentum member.
+// Per-block Q4_0 fake-quantization with EMA block scales tracked in N×K layout.
 //
-// Training:  updates EMA with current-batch stats, quantizes using exact batch stats
-//            (avoids clipping during early training when weights are large).
-// Inference: quantizes using EMA stats (force-feed calibrated scale for nntr_quantize).
-Tensor FullyConnectedLayer::fakeQuantize(const Tensor &x, Tensor &rmin,
-                                          Tensor &rmax, float q_min_val,
-                                          float q_max_val, bool training) {
-  float cur_min = x.minValue();
-  float cur_max = x.maxValue();
+// Blocks are defined in N×K layout (the transposed layout that build_q4_0_natural
+// and the GEMM kernel use). This ensures the EMA scales exactly match the block
+// boundaries used at save time, so force-feeding works correctly.
+//
+// Training:  compute fresh d_fresh per N×K block, bootstrap EMA on first call,
+//            then update: block_d[b] = (1-m)*block_d[b] + m*d_fresh.
+//            Quantize using updated EMA scale.
+// Validation: use current EMA without updating.
+// STE: gradient passes through the clamp+round unchanged.
+Tensor FullyConnectedLayer::fakeQuantizeQ4_0(const Tensor &x,
+                                              std::vector<float> &block_d,
+                                              bool training) {
+  // x is stored K×N in nntrainer (height=K, width=N)
+  const size_t K = x.getDim().height();
+  const size_t N = x.getDim().width();
+  const size_t num_blocks_NK = (K * N) / 32;
 
-  if (training) {
-    float rm = rmin.getValue<float>(0);
-    float rx = rmax.getValue<float>(0);
-    if (std::isinf(rm)) {
-      rmin.setValue(cur_min);
-      rmax.setValue(cur_max);
-    } else {
-      rmin.setValue((1.0f - momentum) * rm + momentum * cur_min);
-      rmax.setValue((1.0f - momentum) * rx + momentum * cur_max);
+  if (block_d.empty())
+    block_d.resize(num_blocks_NK, 0.0f);
+
+  // Compute fresh per-block scales in N×K layout.
+  // For N×K linear index nk = b*32+j: n = nk/K, k = nk%K → K×N index = k*N+n.
+  for (size_t b = 0; b < num_blocks_NK; ++b) {
+    float max_abs = 0.0f;
+    for (size_t j = 0; j < 32; ++j) {
+      const size_t nk  = b * 32 + j;
+      const size_t n   = nk / K;
+      const size_t k   = nk % K;
+      max_abs = std::max(max_abs, std::abs(x.getValue<float>(k * N + n)));
     }
-  } else {
-    cur_min = rmin.getValue<float>(0);
-    cur_max = rmax.getValue<float>(0);
+    const float d_fresh = (max_abs > 1e-8f) ? max_abs / 8.0f : 0.0f;
+    if (training) {
+      if (block_d[b] < 1e-10f)
+        block_d[b] = d_fresh;
+      else
+        block_d[b] = (1.0f - momentum) * block_d[b] + momentum * d_fresh;
+    }
   }
 
-  float range = cur_max - cur_min;
-  if (range < 1e-8f)
-    range = 1e-8f;
-
-  float scale      = range / (q_max_val - q_min_val);
-  float zero_point = q_min_val - std::round(cur_min / scale);
-  zero_point       = std::max(q_min_val, std::min(q_max_val, zero_point));
-
+  // Apply fake-quant iterating K×N order; map each element to its N×K block.
+  // apply() iterates K×N linearly: index i = k*N + n → k = i/N, n = i%N
+  // → N×K index nk = n*K + k → block = nk/32.
   Tensor x_fq = x.clone();
-  std::function<float(float)> quantize_fn =
-    [scale, zero_point, q_min_val, q_max_val](float v) -> float {
-    float q = std::round(v / scale + zero_point);
-    q        = std::max(q_min_val, std::min(q_max_val, q));
-    return (q - zero_point) * scale;
+  size_t i = 0;
+  std::function<float(float)> fn = [&i, K, N, &block_d](float v) -> float {
+    const size_t k  = i / N;
+    const size_t n  = i % N;
+    const size_t b  = (n * K + k) / 32;
+    ++i;
+    const float d = block_d[b];
+    if (d < 1e-10f) return v;
+    float q = std::round(v / d);
+    q = std::max(-8.0f, std::min(7.0f, q));
+    return q * d;
   };
-  x_fq.apply<float>(quantize_fn, x_fq);
+  x_fq.apply<float>(fn, x_fq);
   return x_fq;
-}
-
-void FullyConnectedLayer::printQATStats() const {
-  const auto &lora_rank_prop = std::get<props::LoraRank>(fc_props);
-  if (lora_rank_prop.empty())
-    return;
-
-  // Only print first 7 layers (one transformer block) to avoid flooding
-  static int printed = 0;
-  if (printed == 0)
-    std::cerr << "\n[QAT] Final calibration stats (first transformer block):\n";
-  if (printed++ >= 7)
-    return;
-
-  float a_min   = lora_a_rmin.getValue<float>(0);
-  float a_max   = lora_a_rmax.getValue<float>(0);
-  float a_scale = std::max(a_max - a_min, 1e-8f) / (q_max - q_min);
-
-  float b_min   = lora_b_rmin.getValue<float>(0);
-  float b_max   = lora_b_rmax.getValue<float>(0);
-  float b_scale = std::max(b_max - b_min, 1e-8f) / (q_max - q_min);
-
-  std::cerr << "  layer" << printed << ":"
-            << " loraA scale=" << a_scale
-            << " [" << a_min << ", " << a_max << "]"
-            << " | loraB scale=" << b_scale
-            << " [" << b_min << ", " << b_max << "]\n";
-  std::cerr << std::flush;
-}
-
-FullyConnectedLayer::LoRAQATStats FullyConnectedLayer::getLoRAQATStats() const {
-  LoRAQATStats s;
-  if (!qat_initialized_)
-    return s;
-  s.a_min   = lora_a_rmin.getValue<float>(0);
-  s.a_max   = lora_a_rmax.getValue<float>(0);
-  s.a_scale = std::max(s.a_max - s.a_min, 1e-8f) / (q_max - q_min);
-  s.b_min   = lora_b_rmin.getValue<float>(0);
-  s.b_max   = lora_b_rmax.getValue<float>(0);
-  s.b_scale = std::max(s.b_max - s.b_min, 1e-8f) / (q_max - q_min);
-  s.valid   = true;
-  return s;
 }
 
 FullyConnectedLayer::LoRAQATStats
@@ -161,6 +132,15 @@ FullyConnectedLayer::getRegisteredStats(const std::string &layer_name) {
   std::lock_guard<std::mutex> lock(s_registry_mutex);
   auto it = s_qat_registry.find(layer_name);
   if (it != s_qat_registry.end())
+    return it->second;
+  return {};
+}
+
+std::pair<std::vector<float>, std::vector<float>>
+FullyConnectedLayer::getRegisteredBlockScales(const std::string &layer_name) {
+  std::lock_guard<std::mutex> lock(s_registry_mutex);
+  auto it = s_block_d_registry.find(layer_name);
+  if (it != s_block_d_registry.end())
     return it->second;
   return {};
 }
@@ -310,23 +290,12 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
       context.requestTensor(loraOut_dim, "hidden_lora", Initializer::NONE, true,
                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
 
-    // Initialize QAT EMA running stats (scalar tensors, live in layer object)
     if (lora_qat_mode) {
-      lora_a_rmin = Tensor({1});
-      lora_a_rmax = Tensor({1});
-      lora_b_rmin = Tensor({1});
-      lora_b_rmax = Tensor({1});
-      lora_a_rmin.setValue(std::numeric_limits<float>::infinity());
-      lora_a_rmax.setValue(-std::numeric_limits<float>::infinity());
-      lora_b_rmin.setValue(std::numeric_limits<float>::infinity());
-      lora_b_rmax.setValue(-std::numeric_limits<float>::infinity());
-      qat_initialized_ = true;
       layer_name_ = context.getName();
       static int qat_layer_count = 0;
       if (++qat_layer_count == 1)
-        std::cerr << "[QAT] LoRA QAT active: q_range=[" << q_min << ", "
-                  << q_max << "] (16 levels, Q4_0). "
-                  << "Final EMA stats printed at exit.\n";
+        std::cerr << "[QAT] LoRA QAT active: per-block Q4_0 fake-quant "
+                     "(16 levels, block=32, symmetric).\n";
     }
   }
 
@@ -386,24 +355,22 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     const bool lora_qat = !std::get<props::LoraQAT>(fc_props).empty() &&
                            std::get<props::LoraQAT>(fc_props).get();
     if (lora_qat) {
-      if (training) {
-        // Training: update EMA stats and fake-quantize using current-batch range
-        a_fq = fakeQuantize(loraA, lora_a_rmin, lora_a_rmax, q_min, q_max, true);
-        b_fq = fakeQuantize(loraB, lora_b_rmin, lora_b_rmax, q_min, q_max, true);
-        // Push current EMA stats into the global registry so transformer.cpp
-        // can read them without a dynamic_cast across the .so boundary.
-        {
-          LoRAQATStats s = getLoRAQATStats();
-          std::lock_guard<std::mutex> lk(s_registry_mutex);
-          s_qat_registry[layer_name_] = s;
-        }
-      } else {
-        // Inference/validation: use EMA-calibrated stats for fake-quantize.
-        // Do NOT write back to loraA/loraB — that would corrupt Adam's momentum
-        // state (force-feed at validation time fights the optimizer every epoch).
-        // Weight snapping for nntr_quantize export is handled at save time only.
-        a_fq = fakeQuantize(loraA, lora_a_rmin, lora_a_rmax, q_min, q_max, false);
-        b_fq = fakeQuantize(loraB, lora_b_rmin, lora_b_rmax, q_min, q_max, false);
+      // Per-block EMA fake-quant: training updates EMA, validation reads it.
+      a_fq = fakeQuantizeQ4_0(loraA, lora_a_block_d, training);
+      b_fq = fakeQuantizeQ4_0(loraB, lora_b_block_d, training);
+      // Push current EMA stats to both registries.
+      if (!lora_a_block_d.empty() && !lora_b_block_d.empty()) {
+        LoRAQATStats s;
+        s.a_min = loraA.minValue();  s.a_max = loraA.maxValue();
+        s.a_scale = std::accumulate(lora_a_block_d.begin(), lora_a_block_d.end(), 0.0f)
+                    / static_cast<float>(lora_a_block_d.size());
+        s.b_min = loraB.minValue();  s.b_max = loraB.maxValue();
+        s.b_scale = std::accumulate(lora_b_block_d.begin(), lora_b_block_d.end(), 0.0f)
+                    / static_cast<float>(lora_b_block_d.size());
+        s.valid = true;
+        std::lock_guard<std::mutex> lk(s_registry_mutex);
+        s_qat_registry[layer_name_]    = s;
+        s_block_d_registry[layer_name_] = {lora_a_block_d, lora_b_block_d};
       }
       input_.dot(a_fq, hidden_tmp_lora, false, false);
       hidden_tmp_lora.dot(b_fq, hidden_out_lora, false, false);
@@ -510,8 +477,10 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
       w_fp32 = weight;
     }
 
+    const bool lora_qat_deriv = !std::get<props::LoraQAT>(fc_props).empty() &&
+                                std::get<props::LoraQAT>(fc_props).get();
     Tensor lora_contrib;
-    if (qat_initialized_) {
+    if (lora_qat_deriv) {
       // chain-rule STE: dL/dx uses the same a_fq/b_fq that the forward used
       lora_contrib = a_fq.dot(b_fq).multiply(lora_scaling);
     } else {
@@ -572,7 +541,9 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
       djdlb, lora_derivative_, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraB]));
 
-    if (qat_initialized_) {
+    const bool lora_qat_grad = !std::get<props::LoraQAT>(fc_props).empty() &&
+                               std::get<props::LoraQAT>(fc_props).get();
+    if (lora_qat_grad) {
       // chain-rule STE: dL/d(loraTmp) = dL/dy_lora · b_fq^T
       djdtmp.dot_deriv_wrt_1(
         b_fq, lora_derivative_, false, false,
