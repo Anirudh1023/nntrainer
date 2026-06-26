@@ -17,6 +17,8 @@
 #include <iostream>
 #include <stdexcept>
 
+#include <lm_head.h>  // for g_lm_head_read_row
+
 namespace causallm {
 
 TrainingDataGenerator::TrainingDataGenerator(tokenizers::Tokenizer *tokenizer,
@@ -103,11 +105,13 @@ int TrainingDataGenerator::dataCb(float **input, float **label, bool *last,
   const auto &ids = self->samples_[self->current_idx_];
   unsigned int available = static_cast<unsigned int>(ids.size());
 
-  // Label = last token in the sequence (e.g. "Positive" / "Negative").
-  // Input = everything before it, LEFT-padded to seq_len so the last real
-  // token sits at position seq_len-1 (where lm_head reads from).
-  // Right-padding would put the last real token at an early position followed
-  // by many padding tokens, making the lm_head predict from a padding state.
+  // Label = last token in the sequence (the rating digit).
+  // Input = everything before it, RIGHT-padded to seq_len.
+  //   Real tokens occupy positions 0..used-1; pads (token 0) at used..seq_len-1.
+  //   Causal attention naturally excludes the future pad positions from position
+  //   used-1, so no pad-token corruption reaches the final hidden state.
+  //   g_lm_head_read_row is set to (used-1) so forwarding() and calcDerivative()
+  //   operate on the correct row instead of the default height-1 (a pad).
 
   unsigned int label_token = 0;
 
@@ -117,15 +121,18 @@ int TrainingDataGenerator::dataCb(float **input, float **label, bool *last,
     unsigned int input_len = available - 1;
     unsigned int start = (input_len > self->seq_len_) ? (input_len - self->seq_len_) : 0;
     unsigned int used = input_len - start;
-    unsigned int pad  = self->seq_len_ - used;
 
-    for (unsigned int j = 0; j < pad; ++j)
-      input[0][j] = 0.0f;
     for (unsigned int j = 0; j < used; ++j)
-      input[0][pad + j] = static_cast<float>(ids[start + j]);
+      input[0][j] = static_cast<float>(ids[start + j]);
+    for (unsigned int j = used; j < self->seq_len_; ++j)
+      input[0][j] = 0.0f;
+
+    // Tell lm_head which row is the final real token.
+    g_lm_head_read_row = used - 1;
   } else {
     for (unsigned int j = 0; j < self->seq_len_; ++j)
       input[0][j] = 0.0f;
+    g_lm_head_read_row = 0;
   }
 
   for (unsigned int v = 0; v < self->vocab_size_; ++v)

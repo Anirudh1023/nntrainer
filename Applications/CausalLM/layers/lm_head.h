@@ -29,6 +29,15 @@
 namespace causallm {
 
 /**
+ * Thread-local read-row override for LoRA training.
+ * UINT_MAX (default) = use the last row (height-1), i.e. inference / left-pad regime.
+ * Set by TrainingDataGenerator::dataCb to (use_len - 1) when right-padding so the
+ * lm_head reads the last *real* token rather than the first pad token.
+ * Persists across both forwarding() and calcDerivative() for the same sample.
+ */
+extern thread_local unsigned int g_lm_head_read_row;
+
+/**
  * @class   LMHead layer
  * @brief   LMHead layer
  */

@@ -23,6 +23,9 @@
 
 namespace causallm {
 
+// UINT_MAX = inference default (reads height-1). Training sets this to use_len-1.
+thread_local unsigned int g_lm_head_read_row = UINT_MAX;
+
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 enum LmHeadParams {
@@ -114,7 +117,11 @@ void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   unsigned int height = input_.getDim().height();
-  incremental_forwarding(context, 0, height, training);
+  // During training with right-padded input, g_lm_head_read_row holds the index
+  // of the last *real* token (set by TrainingDataGenerator::dataCb). UINT_MAX
+  // means use the default (last row = height-1) for inference.
+  unsigned int read_h = (g_lm_head_read_row != UINT_MAX) ? (g_lm_head_read_row + 1) : height;
+  incremental_forwarding(context, 0, read_h, training);
 }
 
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
@@ -178,7 +185,8 @@ void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   ml::train::TensorDim dy_step_dim = dy_dim;
   dy_step_dim.batch(1);
 
-  unsigned int last_row = dx_dim.height() - 1;
+  unsigned int last_row = (g_lm_head_read_row != UINT_MAX) ? g_lm_head_read_row
+                                                            : (dx_dim.height() - 1);
 
   for (unsigned int b = 0; b < dx_dim.batch(); ++b) {
     nntrainer::Tensor dx_last = dx.getSharedDataTensor(
