@@ -14,6 +14,7 @@
 #define __LORA_TRAIN_H__
 
 #include <functional>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,8 @@ private:
   unsigned int vocab_size_;
   std::vector<std::vector<int>> samples_;
   unsigned int current_idx_;
+  std::vector<size_t> index_order_;
+  std::mt19937 rng_;
 
   void reset();
 };

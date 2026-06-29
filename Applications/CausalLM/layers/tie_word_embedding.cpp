@@ -25,6 +25,12 @@ namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
+// Set by the embedding-mode instance during forwarding() to tell the lm_head-mode
+// instance which row holds the last real token (right-pad regime).
+// UINT_MAX = not set / use the default last row (seq_len-1).
+// Both instances run on the same main training thread, so no synchronization needed.
+static unsigned int g_twe_lmhead_read_pos = UINT_MAX;
+
 enum TieWordEmbeddingParams {
   weight,
   bias,
@@ -176,16 +182,23 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
 
   if (mode_ == mode::embedding) {
     unsigned int seq_len = input_.getDim().width();
+    // Detect the last real-token position for right-padded inputs.
+    // Real tokens have non-zero IDs; pads are 0.0f at positions used..seq_len-1.
+    // Scanning from the end finds used-1 without needing cross-thread communication.
+    {
+      float *in_data = input_.getAddress<float>(0);
+      unsigned int used = seq_len;
+      while (used > 0 && in_data[used - 1] == 0.0f) used--;
+      g_twe_lmhead_read_pos = (used > 0) ? (used - 1) : (seq_len - 1);
+    }
     incremental_forwarding(context, 0, seq_len, training);
   } else if (mode_ == mode::lm_head) {
-    // Use incremental_forwarding_lmhead which correctly extracts only the
-    // last token's hidden state for the logit computation.
-    // The direct dot product (input_.dot(weight, hidden_, false, true))
-    // was incorrect because input_ has shape [B, 1, seq_len, hidden_dim]
-    // but output has shape [B, 1, 1, vocab_size], causing a position
-    // mismatch (position 0 vs last position).
+    // Use the last real-token position detected by the embedding instance.
+    // Falls back to seq_len-1 if not set (e.g. left-pad / clean inference path).
     unsigned int seq_len = input_.getDim().height();
-    incremental_forwarding_lmhead(context, 0, seq_len, training);
+    unsigned int read_pos = (g_twe_lmhead_read_pos != UINT_MAX)
+                              ? g_twe_lmhead_read_pos : (seq_len - 1);
+    incremental_forwarding_lmhead(context, 0, read_pos + 1, training);
   } else {
     throw std::invalid_argument("Unknown mode in TieWordEmbedding forwarding");
   }
@@ -348,12 +361,15 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
     // Zero the entire derivative tensor first
     dx.setZero();
 
+    unsigned int last_pos = (g_twe_lmhead_read_pos != UINT_MAX)
+                              ? g_twe_lmhead_read_pos : (seq_len - 1);
+
     for (unsigned int b = 0; b < b_size; ++b) {
-      // Get a view of the last position in dx for this batch
+      // Get a view of the last real-token position in dx for this batch
       nntrainer::TensorDim last_pos_dim(1, 1, 1, hidden_dim,
                                         dx.getTensorType());
       size_t last_pos_offset =
-        b * dx.getDim().getFeatureLen() + (seq_len - 1) * hidden_dim;
+        b * dx.getDim().getFeatureLen() + last_pos * hidden_dim;
       nntrainer::Tensor dx_last =
         dx.getSharedDataTensor(last_pos_dim, last_pos_offset, true);
 
@@ -446,12 +462,15 @@ void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
       dweight.setZero();
     }
 
+    unsigned int last_pos = (g_twe_lmhead_read_pos != UINT_MAX)
+                              ? g_twe_lmhead_read_pos : (seq_len - 1);
+
     for (unsigned int b = 0; b < b_size; ++b) {
-      // Get the last position of input for this batch
+      // Get the last real-token position of input for this batch
       nntrainer::TensorDim last_pos_dim(1, 1, 1, hidden_dim,
                                         in.getTensorType());
       size_t last_pos_offset =
-        b * in.getDim().getFeatureLen() + (seq_len - 1) * hidden_dim;
+        b * in.getDim().getFeatureLen() + last_pos * hidden_dim;
       nntrainer::Tensor in_last =
         in.getSharedDataTensor(last_pos_dim, last_pos_offset, true);
 

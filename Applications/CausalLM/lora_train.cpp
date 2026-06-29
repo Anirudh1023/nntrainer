@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 
 #include <lm_head.h>  // for g_lm_head_read_row
@@ -27,7 +28,8 @@ TrainingDataGenerator::TrainingDataGenerator(tokenizers::Tokenizer *tokenizer,
   tokenizer_(tokenizer),
   seq_len_(seq_len),
   vocab_size_(vocab_size),
-  current_idx_(0) {}
+  current_idx_(0),
+  rng_(std::random_device{}()) {}
 
 void TrainingDataGenerator::loadTextFile(const std::string &path) {
   std::ifstream file(path);
@@ -77,6 +79,11 @@ void TrainingDataGenerator::loadTextFile(const std::string &path) {
 
   std::cout << "[TrainingData] Loaded " << path << " — " << count
             << " samples." << std::endl;
+
+  // Build initial shuffled index order after all samples are loaded.
+  index_order_.resize(samples_.size());
+  std::iota(index_order_.begin(), index_order_.end(), 0);
+  std::shuffle(index_order_.begin(), index_order_.end(), rng_);
 }
 
 void TrainingDataGenerator::addTokenIds(const std::vector<int> &ids) {
@@ -87,11 +94,18 @@ unsigned int TrainingDataGenerator::getNumSamples() const {
   return static_cast<unsigned int>(samples_.size());
 }
 
-void TrainingDataGenerator::reset() { current_idx_ = 0; }
+void TrainingDataGenerator::reset() {
+  current_idx_ = 0;
+  std::shuffle(index_order_.begin(), index_order_.end(), rng_);
+}
 
 void TrainingDataGenerator::limitSamples(unsigned int max_samples) {
-  if (max_samples < samples_.size())
+  if (max_samples < samples_.size()) {
     samples_.resize(max_samples);
+    index_order_.resize(max_samples);
+    std::iota(index_order_.begin(), index_order_.end(), 0);
+    std::shuffle(index_order_.begin(), index_order_.end(), rng_);
+  }
 }
 
 int TrainingDataGenerator::dataCb(float **input, float **label, bool *last,
@@ -102,7 +116,7 @@ int TrainingDataGenerator::dataCb(float **input, float **label, bool *last,
   if (self->current_idx_ >= self->samples_.size())
     self->reset();
 
-  const auto &ids = self->samples_[self->current_idx_];
+  const auto &ids = self->samples_[self->index_order_[self->current_idx_]];
   unsigned int available = static_cast<unsigned int>(ids.size());
 
   // Label = last token in the sequence (the rating digit).
