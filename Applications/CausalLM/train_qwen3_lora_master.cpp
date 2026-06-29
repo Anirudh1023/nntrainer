@@ -64,7 +64,7 @@ int main(int argc, char *argv[]) {
                  " [--lr <float>] [--epochs <int>]"
                  " [--output <path>] [--lora_path <path>]"
                  " [--max_samples <int>] [--skip_weights]"
-                 " [--lora_qat] [--lora_q4]\n";
+                 " [--lora_qat] [--lora_q4] [--seed <int>]\n";
     return 1;
   }
 
@@ -79,6 +79,7 @@ int main(int argc, char *argv[]) {
   unsigned int patience = 5;
   bool lora_qat = false;
   bool lora_q4  = false;  // Q4_0 LoRA: implies lora_qat, uses Q4_0 fake-quant range
+  unsigned int seed = 42;
 
   for (int i = 3; i < argc; ++i) {
     std::string arg = argv[i];
@@ -100,6 +101,8 @@ int main(int argc, char *argv[]) {
       lora_qat = true;
     else if (arg == "--lora_q4")
       lora_q4 = true;  // save as Q4_0 PTQ at each checkpoint; no QAT needed
+    else if (arg == "--seed" && i + 1 < argc)
+      seed = static_cast<unsigned int>(std::atoi(argv[++i]));
   }
 
   try {
@@ -174,7 +177,7 @@ int main(int argc, char *argv[]) {
     unsigned int seq_len   = nntr_cfg["init_seq_len"].get<unsigned int>();
     unsigned int vocab_size = cfg["vocab_size"].get<unsigned int>();
 
-    causallm::TrainingDataGenerator data_gen(tokenizer.get(), seq_len, vocab_size);
+    causallm::TrainingDataGenerator data_gen(tokenizer.get(), seq_len, vocab_size, seed);
     data_gen.loadTextFile(train_data_path);
 
     if (max_samples > 0 &&

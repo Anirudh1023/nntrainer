@@ -24,12 +24,15 @@ namespace causallm {
 
 TrainingDataGenerator::TrainingDataGenerator(tokenizers::Tokenizer *tokenizer,
                                              unsigned int seq_len,
-                                             unsigned int vocab_size) :
+                                             unsigned int vocab_size,
+                                             unsigned int seed) :
   tokenizer_(tokenizer),
   seq_len_(seq_len),
   vocab_size_(vocab_size),
   current_idx_(0),
-  rng_(std::random_device{}()) {}
+  rng_(seed) {
+  std::cout << "[TrainingData] shuffle seed=" << seed << std::endl;
+}
 
 void TrainingDataGenerator::loadTextFile(const std::string &path) {
   std::ifstream file(path);

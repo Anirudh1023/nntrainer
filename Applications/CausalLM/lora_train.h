@@ -42,7 +42,7 @@ public:
    * @param vocab_size Vocabulary size for one-hot representation
    */
   TrainingDataGenerator(tokenizers::Tokenizer *tokenizer, unsigned int seq_len,
-                        unsigned int vocab_size);
+                        unsigned int vocab_size, unsigned int seed = 42);
 
   /**
    * @brief Load training text from a file (one sample per line)
